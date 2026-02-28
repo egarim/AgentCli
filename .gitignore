@@ -1,0 +1,6 @@
+# AgentCli — Git ignore
+bin/
+obj/
+.vs/
+*.user
+~/.agentcli/
