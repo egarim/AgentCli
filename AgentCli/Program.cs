@@ -13,12 +13,15 @@ async Task<string?> LoadGitHubTokenAsync()
     try { return JsonNode.Parse(await File.ReadAllTextAsync(configFile))?["github_token"]?.GetValue<string>(); }
     catch { return null; }
 }
-
 async Task SaveGitHubTokenAsync(string token)
 {
     await File.WriteAllTextAsync(configFile, new JsonObject { ["github_token"] = token }.ToJsonString());
     Console.WriteLine($"Token saved to {configFile}");
 }
+
+// ─── Provider config (providers.json) ────────────────────────────────────────
+var providerCfg = new ProviderConfig();
+await providerCfg.LoadAsync();
 
 // ─── Memory + Soul ────────────────────────────────────────────────────────────
 var memory = MemorySystem.CreateFile();
@@ -40,7 +43,6 @@ if (!await memory.Provider.ExistsAsync(MemorySystem.KeyWorkflow))
     await memory.WriteWorkflowAutoAsync("""
         # WORKFLOW_AUTO.md
         # Files listed here are automatically read on every startup.
-        # Ensures protocols are restored after context resets / compaction.
         # Supports date placeholder: memory/YYYY-MM-DD.md (resolves to today + yesterday)
 
         - MEMORY.md
@@ -76,16 +78,18 @@ if (githubToken == null || args.Contains("--login"))
     await SaveGitHubTokenAsync(githubToken);
 }
 
-// ─── Provider registry ────────────────────────────────────────────────────────
-var registry = ProviderRegistry.FromEnvironment(http, tokenService, githubToken);
+// ─── CLI flag parsing ─────────────────────────────────────────────────────────
+string? cliProvider = args.SkipWhile(a => a != "--provider").Skip(1).FirstOrDefault();
+string? cliModel    = args.SkipWhile(a => a != "--model").Skip(1).FirstOrDefault();
 
-// Honour --provider <id> flag
-var providerArg = args.SkipWhile(a => a != "--provider").Skip(1).FirstOrDefault();
-if (providerArg != null)
-{
-    try { registry.SetActive(providerArg); }
-    catch (Exception ex) { Console.WriteLine($"Warning: {ex.Message}"); }
-}
+// ─── Provider registry ────────────────────────────────────────────────────────
+var registry = ProviderRegistry.Build(
+    http,
+    copilotTokenService: tokenService,
+    githubToken:         githubToken,
+    cfg:                 providerCfg,
+    overrideProvider:    cliProvider
+);
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 var memoryContext = await memory.BuildContextAsync();
@@ -95,17 +99,22 @@ var systemPrompt  = string.IsNullOrWhiteSpace(memoryContext)
       {memoryContext}
 
       ---
-      You have access to tools. Use memory_write to remember important things the user tells you.
+      You have tools. Use memory_write to remember important things the user tells you.
       Use memory_search to recall past conversations. Be direct and concise.
       """;
 
-// ─── Agent (rebuilt on /switch) ───────────────────────────────────────────────
-AgentLoop BuildAgent() => new AgentLoop(registry.Active, systemPrompt,
-    args.SkipWhile(a => a != "--model").Skip(1).FirstOrDefault());
+// ─── Agent factory ────────────────────────────────────────────────────────────
+// Model priority: CLI flag > providers.json > provider default
+string ResolveModel() =>
+    cliModel
+    ?? providerCfg.Model(registry.ActiveId)
+    ?? registry.Active.DefaultModel;
+
+AgentLoop BuildAgent() => new AgentLoop(registry.Active, systemPrompt, ResolveModel());
 
 var agent = BuildAgent();
 
-// ─── Tool registration helper ─────────────────────────────────────────────────
+// ─── Tool registration ────────────────────────────────────────────────────────
 void RegisterTools(AgentLoop a)
 {
     a.RegisterTool("get_time", "Returns the current local date and time",
@@ -128,12 +137,8 @@ void RegisterTools(AgentLoop a)
     a.RegisterTool("memory_write",
         "Saves an important fact to long-term memory (MEMORY.md)",
         new { type = "object",
-              properties = new
-              {
-                  section = new { type = "string" },
-                  content = new { type = "string" }
-              },
-              required = new[] { "section", "content" } },
+              properties = new { section = new { type = "string" }, content = new { type = "string" } },
+              required   = new[] { "section", "content" } },
         async args2 =>
         {
             await memory.AppendMemoryAsync(
@@ -154,8 +159,7 @@ void RegisterTools(AgentLoop a)
             foreach (var r in results)
             {
                 sb2.AppendLine($"[{Path.GetFileName(r.Path)}:{r.Line}] score={r.Score:F2}");
-                sb2.AppendLine(r.Snippet);
-                sb2.AppendLine();
+                sb2.AppendLine(r.Snippet); sb2.AppendLine();
             }
             return sb2.ToString().Trim();
         });
@@ -195,19 +199,20 @@ RegisterTools(agent);
 Console.WriteLine();
 Console.ForegroundColor = ConsoleColor.Green;
 Console.WriteLine("AgentCli ready. Type your message (Ctrl+C to exit, 'exit' to quit)");
+Console.ForegroundColor = ConsoleColor.DarkGray;
 Console.WriteLine($"Workspace : {memory.WorkspaceDir ?? "(in-memory)"} [{memory.ProviderName}]");
 Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine($"Provider  : {registry.Active.DisplayName} ({registry.Active.Id}) — model: {args.SkipWhile(a => a != "--model").Skip(1).FirstOrDefault() ?? registry.Active.DefaultModel}");
+Console.WriteLine($"Provider  : {registry.Active.DisplayName} ({registry.Active.Id}) — model: {ResolveModel()}");
+Console.ForegroundColor = ConsoleColor.DarkGray;
+Console.WriteLine($"Config    : {providerCfg.ConfigPath}");
 
 var startupLoaded = await memory.RunStartupReadsAsync();
 if (startupLoaded.Count > 0)
-{
-    Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine($"Startup   : {string.Join(", ", startupLoaded.Select(f => f.RelativePath))}");
-}
 
-Console.ForegroundColor = ConsoleColor.DarkGray;
-Console.WriteLine("Commands  : /memory  /soul  /daily  /workflow  /providers  /switch <id>");
+Console.WriteLine("Commands  : /providers  /switch <id>  /config set <provider> <key> <value>");
+Console.WriteLine("            /config get <provider> <key>  /config default <provider>  /config show");
+Console.WriteLine("            /memory  /soul  /daily  /workflow");
 Console.ResetColor();
 Console.WriteLine();
 
@@ -222,43 +227,42 @@ while (true)
     if (string.IsNullOrEmpty(input)) continue;
     if (input.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
 
-    // ── Built-in commands ──────────────────────────────────────────────────────
-
+    // ── Memory / soul / workflow commands ──────────────────────────────────────
     if (input == "/memory")
     {
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(await memory.ReadMemoryAsync() ?? "(empty)");
-        Console.ResetColor(); Console.WriteLine(); continue;
+        Print(await memory.ReadMemoryAsync() ?? "(empty)"); continue;
     }
     if (input == "/soul")
     {
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(await memory.ReadSoulAsync() ?? "(empty)");
-        Console.ResetColor(); Console.WriteLine(); continue;
+        Print(await memory.ReadSoulAsync() ?? "(empty)"); continue;
     }
     if (input == "/daily")
     {
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(await memory.ReadDailyAsync() ?? "(no daily note today)");
-        Console.ResetColor(); Console.WriteLine(); continue;
+        Print(await memory.ReadDailyAsync() ?? "(no daily note today)"); continue;
     }
     if (input == "/workflow")
     {
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(await memory.ReadWorkflowAutoAsync() ?? "(not found)");
-        Console.ResetColor(); Console.WriteLine(); continue;
+        Print(await memory.ReadWorkflowAutoAsync() ?? "(not found)"); continue;
     }
+
+    // ── Provider commands ──────────────────────────────────────────────────────
     if (input == "/providers")
     {
         Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine("Available providers:");
+        Console.WriteLine($"{"ID",-22} {"Display name",-22} {"Default model",-35} Config/Env");
+        Console.WriteLine(new string('─', 100));
         foreach (var p in registry.All)
         {
-            var active = p.Id == registry.ActiveId ? " ◀ active" : "";
-            Console.WriteLine($"  {p.Id,-20} {p.DisplayName} (default model: {p.DefaultModel}){active}");
+            var active     = p.Id == registry.ActiveId ? " ◀" : "";
+            var cfgModel   = providerCfg.Model(p.Id);
+            var modelLabel = cfgModel != null ? $"{p.DefaultModel} (cfg: {cfgModel})" : p.DefaultModel;
+            var hasKey     = providerCfg.ApiKey(p.Id) != null ? "cfg" :
+                             Environment.GetEnvironmentVariable(p.Id.ToUpper().Replace("-","_") + "_API_KEY") != null ? "env" : "—";
+            Console.WriteLine($"  {p.Id,-20} {p.DisplayName,-22} {modelLabel,-35} key={hasKey}{active}");
         }
         Console.ResetColor(); Console.WriteLine(); continue;
     }
+
     if (input.StartsWith("/switch "))
     {
         var newId = input["/switch ".Length..].Trim();
@@ -268,7 +272,7 @@ while (true)
             agent = BuildAgent();
             RegisterTools(agent);
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"Switched to: {registry.Active.DisplayName} ({registry.Active.Id})");
+            Console.WriteLine($"Switched to: {registry.Active.DisplayName} — model: {ResolveModel()}");
         }
         catch (Exception ex)
         {
@@ -276,6 +280,72 @@ while (true)
             Console.WriteLine($"Error: {ex.Message}");
         }
         Console.ResetColor(); Console.WriteLine(); continue;
+    }
+
+    // ── /config commands ───────────────────────────────────────────────────────
+    if (input == "/config show")
+    {
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.WriteLine($"Config file: {providerCfg.ConfigPath}");
+        Console.WriteLine($"Default provider: {providerCfg.DefaultProvider ?? "(not set)"}");
+        foreach (var kvp in providerCfg.AllProviders())
+        {
+            Console.WriteLine($"  [{kvp.Key}]");
+            foreach (var prop in kvp.Value)
+            {
+                // Mask keys
+                var val = prop.Key == "apiKey"
+                    ? MaskKey(prop.Value?.ToString())
+                    : prop.Value?.ToString();
+                Console.WriteLine($"    {prop.Key} = {val}");
+            }
+        }
+        Console.ResetColor(); Console.WriteLine(); continue;
+    }
+
+    if (input.StartsWith("/config set "))
+    {
+        // /config set <provider> <key> <value>
+        var parts = input["/config set ".Length..].Split(' ', 3);
+        if (parts.Length < 3) { PrintErr("Usage: /config set <provider> <key> <value>"); continue; }
+        providerCfg.Set(parts[0], parts[1], parts[2]);
+        await providerCfg.SaveAsync();
+        // Rebuild registry so new key takes effect immediately
+        registry = ProviderRegistry.Build(http, tokenService, githubToken, providerCfg, cliProvider);
+        agent = BuildAgent(); RegisterTools(agent);
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"Set [{parts[0]}].{parts[1]} — saved. Registry rebuilt.");
+        Console.ResetColor(); Console.WriteLine(); continue;
+    }
+
+    if (input.StartsWith("/config get "))
+    {
+        var parts = input["/config get ".Length..].Split(' ', 2);
+        if (parts.Length < 2) { PrintErr("Usage: /config get <provider> <key>"); continue; }
+        var val = providerCfg.Get(parts[0], parts[1]);
+        Print(val != null ? (parts[1] == "apiKey" ? MaskKey(val) : val) : "(not set)");
+        continue;
+    }
+
+    if (input.StartsWith("/config unset "))
+    {
+        var parts = input["/config unset ".Length..].Split(' ', 2);
+        if (parts.Length < 2) { PrintErr("Usage: /config unset <provider> <key>"); continue; }
+        providerCfg.Set(parts[0], parts[1], null);
+        await providerCfg.SaveAsync();
+        registry = ProviderRegistry.Build(http, tokenService, githubToken, providerCfg, cliProvider);
+        agent = BuildAgent(); RegisterTools(agent);
+        Print($"Removed [{parts[0]}].{parts[1]} — saved.");
+        continue;
+    }
+
+    if (input.StartsWith("/config default "))
+    {
+        var newDefault = input["/config default ".Length..].Trim();
+        providerCfg.DefaultProvider = newDefault;
+        await providerCfg.SaveAsync();
+        Print($"Default provider set to '{newDefault}' in {providerCfg.ConfigPath}");
+        continue;
     }
 
     // ── Agent turn ────────────────────────────────────────────────────────────
@@ -290,6 +360,25 @@ while (true)
         Console.WriteLine($"Error: {ex.Message}");
         Console.ResetColor();
     }
-
     Console.WriteLine();
 }
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+void Print(string text)
+{
+    Console.ForegroundColor = ConsoleColor.DarkCyan;
+    Console.WriteLine(text);
+    Console.ResetColor();
+    Console.WriteLine();
+}
+
+void PrintErr(string text)
+{
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine(text);
+    Console.ResetColor();
+    Console.WriteLine();
+}
+
+string? MaskKey(string? key) => key == null ? null :
+    key.Length <= 8 ? "****" : key[..4] + new string('*', Math.Min(key.Length - 8, 20)) + key[^4..];
