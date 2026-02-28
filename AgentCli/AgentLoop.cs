@@ -5,48 +5,75 @@ using System.Text.Json.Nodes;
 namespace AgentCli;
 
 /// <summary>
-/// Simple agentic loop: send message → stream response → execute tools → repeat.
-/// Provider-agnostic — works with any IAiProvider.
+/// Agentic loop: send message → stream response → gate + execute tools → repeat.
+/// Provider-agnostic, gate-enforced, skill-backed.
 /// </summary>
 public class AgentLoop
 {
-    private readonly IAiProvider       _provider;
-    private readonly string            _model;
+    private readonly IAiProvider  _provider;
+    private readonly string       _model;
+    private readonly IToolGate    _gate;
     private readonly List<ChatMessage> _history = new();
 
-    private readonly Dictionary<string, (ToolDefinition Def, Func<JsonElement, Task<string>> Handler)>
-        _tools = new();
+    // name → (spec, handler)
+    private readonly Dictionary<string, (ToolSpec Spec, Func<JsonElement, CancellationToken, Task<string>> Handler)>
+        _tools = new(StringComparer.OrdinalIgnoreCase);
 
-    public AgentLoop(IAiProvider provider, string systemPrompt, string? model = null)
+    public AgentLoop(IAiProvider provider, string systemPrompt, string? model = null, IToolGate? gate = null)
     {
         _provider = provider;
         _model    = model ?? provider.DefaultModel;
+        _gate     = gate  ?? new AllowAllGate();
         _history.Add(new ChatMessage("system", systemPrompt));
     }
 
+    // ─── Tool registration ────────────────────────────────────────────────────
+
+    /// <summary>Register a tool with a cancellation-aware handler.</summary>
+    public void RegisterTool(
+        string name,
+        string description,
+        object schema,
+        Func<JsonElement, CancellationToken, Task<string>> handler)
+    {
+        _tools[name] = (new ToolSpec(name, description, schema), handler);
+    }
+
+    /// <summary>Convenience overload — handler without CancellationToken.</summary>
     public void RegisterTool(
         string name,
         string description,
         object schema,
         Func<JsonElement, Task<string>> handler)
+        => RegisterTool(name, description, schema, (a, _) => handler(a));
+
+    /// <summary>Register all tools from a skill (respects gate at call time).</summary>
+    public void RegisterSkill(ISkill skill)
     {
-        _tools[name] = (
-            new ToolDefinition("function", new ToolFunctionDef(name, description, schema)),
-            handler
-        );
+        foreach (var tool in skill.Manifest.Tools)
+            RegisterTool(
+                tool.Name,
+                tool.Description,
+                tool.Schema,
+                (args, ct) => skill.InvokeAsync(tool.Name, args, ct));
     }
 
-    /// <summary>
-    /// Run one user turn. Streams assistant text to console, handles tool calls,
-    /// loops until the model returns a plain text response.
-    /// </summary>
+    /// <summary>Returns the ToolDefinition list for the model (schema serialised via JSON round-trip).</summary>
+    public IReadOnlyList<ToolDefinition> ToolDefinitions =>
+        _tools.Values
+              .Select(t => new ToolDefinition("function",
+                  new ToolFunctionDef(t.Spec.Name, t.Spec.Description, t.Spec.Schema)))
+              .ToList();
+
+    // ─── Main loop ────────────────────────────────────────────────────────────
+
     public async Task<string> RunAsync(string userMessage, CancellationToken ct = default)
     {
         _history.Add(new ChatMessage("user", userMessage));
 
         while (true)
         {
-            var tools = _tools.Values.Select(t => t.Def).ToList();
+            var tools = ToolDefinitions.ToList();
             var sb    = new StringBuilder();
             List<ToolCall>? pendingCalls = null;
 
@@ -99,22 +126,39 @@ public class AgentLoop
             }
 
             Console.WriteLine();
+
             foreach (var call in pendingCalls)
             {
+                var argsJson = string.IsNullOrWhiteSpace(call.Function.Arguments)
+                    ? "{}" : call.Function.Arguments;
+
+                JsonElement args;
+                try   { args = JsonDocument.Parse(argsJson).RootElement; }
+                catch { args = JsonDocument.Parse("{}").RootElement; }
+
+                // ── Gate check ────────────────────────────────────────────────
+                var permission = await _gate.RequestAsync(call.Function.Name, args, ct);
+
+                if (!permission.IsAllowed)
+                {
+                    var reason = $"Permission denied: {call.Function.Name}" +
+                                 (permission.Reason != null ? $" — {permission.Reason}" : "");
+                    Console.ForegroundColor = ConsoleColor.DarkRed;
+                    Console.WriteLine($"  [blocked] {reason}");
+                    Console.ResetColor();
+                    _history.Add(new ChatMessage("tool", reason, ToolCallId: call.Id));
+                    continue;
+                }
+
+                // ── Execute ───────────────────────────────────────────────────
                 Console.ForegroundColor = ConsoleColor.DarkYellow;
-                Console.WriteLine($"[tool] {call.Function.Name}({call.Function.Arguments})");
+                Console.WriteLine($"  [tool] {call.Function.Name}({Truncate(argsJson, 80)})");
                 Console.ResetColor();
 
                 string result;
                 if (_tools.TryGetValue(call.Function.Name, out var entry))
                 {
-                    try
-                    {
-                        var args = JsonDocument.Parse(
-                            string.IsNullOrWhiteSpace(call.Function.Arguments) ? "{}" : call.Function.Arguments
-                        ).RootElement;
-                        result = await entry.Handler(args);
-                    }
+                    try   { result = await entry.Handler(args, ct); }
                     catch (Exception ex) { result = $"Error: {ex.Message}"; }
                 }
                 else
@@ -123,11 +167,14 @@ public class AgentLoop
                 }
 
                 Console.ForegroundColor = ConsoleColor.DarkGreen;
-                Console.WriteLine($"[tool result] {result[..Math.Min(result.Length, 120)]}");
+                Console.WriteLine($"  [result] {Truncate(result, 120)}");
                 Console.ResetColor();
 
                 _history.Add(new ChatMessage("tool", result, ToolCallId: call.Id));
             }
         }
     }
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
 }
