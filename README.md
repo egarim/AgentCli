@@ -19,6 +19,7 @@ Ships as a console app today; designed to run as a cluster of stateless agents t
 - [Skills & Tools](#skills--tools)
 - [Output Formatting](#output-formatting)
 - [Cluster Mode](#cluster-mode)
+- [Token Tracking & Limits](#token-tracking--limits)
 - [Configuration Reference](#configuration-reference)
 - [REPL Commands](#repl-commands)
 - [Adding Providers / Tools / Skills](#extending)
@@ -515,6 +516,228 @@ AGENTCLI_TEST_POSTGRES="Host=86.48.30.121;Port=5432;Database=agentcli_test;Usern
 ```
 
 Tests skip cleanly without the env var — CI works with no DB.
+
+---
+
+## Token Tracking & Limits
+
+AgentCli tracks how many tokens each user consumes and can enforce configurable per-user limits.
+
+Token counts are captured from the provider's SSE stream (the standard OpenAI `usage` field at the end of each response). They accumulate across multi-tool turns within a single `RunAsync` call.
+
+### How it flows
+
+```
+User message → SessionManager.RunAsync()
+  1. Policy check (before turn) → Allow / Warn / Deny
+  2. AgentLoop.RunAsync() → captures TokenUsage from SSE stream
+  3. Ledger.RecordAsync(userId, channel, usage)
+  4. Return SessionTurnResult { Text, Usage, PolicyResult }
+```
+
+If the policy **denies** the turn, `SessionTurnResult.WasDenied = true` and `Text` is `null`. The connector delivers the denial message to the user directly — no exception thrown.
+
+---
+
+### TokenUsage
+
+```csharp
+record TokenUsage(int PromptTokens, int CompletionTokens, int TotalTokens);
+
+// Addition — aggregate across turns or users
+var sum = usageA + usageB;
+
+// Zero sentinel
+var zero = TokenUsage.Zero;
+```
+
+---
+
+### Ledger — recording & querying
+
+Two implementations, same `ITokenLedger` interface:
+
+#### InMemoryTokenLedger
+Zero dependencies. Resets on restart. Good for single-process CLI and tests.
+
+```csharp
+var ledger = new InMemoryTokenLedger();
+
+// Record after a turn
+await ledger.RecordAsync("user-123", "telegram", usage, model: "gpt-4o", provider: "openai");
+
+// Query
+var today    = await ledger.GetTodayAsync("user-123", "telegram");
+var week     = await ledger.GetWindowAsync("user-123", "telegram", TimeSpan.FromDays(7));
+var lifetime = await ledger.GetTotalAsync("user-123", "telegram");
+
+// Admin overview — all users, ordered by total tokens desc
+var all = await ledger.GetAllUsersAsync();
+foreach (var row in all)
+    Console.WriteLine($"{row.UserId} / {row.Channel}: {row.Total.TotalTokens} total, {row.Today.TotalTokens} today");
+```
+
+#### PostgresTokenLedger
+Durable. Shared across all agents in a cluster. One row per turn in `agentcli.token_usage`.
+
+```csharp
+await using var ledger = new PostgresTokenLedger(connectionString);
+// Same interface — same calls as above
+```
+
+Schema (auto-created by `PostgresConversationStore.EnsureSchemaAsync`):
+
+```sql
+-- agentcli.token_usage
+id                BIGSERIAL   PRIMARY KEY,
+user_id           TEXT        NOT NULL,
+channel           TEXT        NOT NULL,   -- "telegram", "whatsapp", etc.
+prompt_tokens     INTEGER     NOT NULL DEFAULT 0,
+completion_tokens INTEGER     NOT NULL DEFAULT 0,
+total_tokens      INTEGER     NOT NULL DEFAULT 0,
+model             TEXT,                   -- e.g. "gpt-4o-mini"
+provider          TEXT,                   -- e.g. "openai"
+recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+```
+
+Query examples:
+
+```sql
+-- Today's usage per user
+SELECT user_id, channel, SUM(total_tokens)
+FROM agentcli.token_usage
+WHERE recorded_at >= CURRENT_DATE
+GROUP BY user_id, channel
+ORDER BY SUM(total_tokens) DESC;
+
+-- Top 10 users this month
+SELECT user_id, SUM(total_tokens) AS monthly_tokens
+FROM agentcli.token_usage
+WHERE recorded_at >= date_trunc('month', NOW())
+GROUP BY user_id
+ORDER BY monthly_tokens DESC
+LIMIT 10;
+```
+
+---
+
+### Policy — enforcing limits
+
+`ConfigurableTokenPolicy` supports global defaults with per-user overrides.
+
+#### TokenLimits
+
+```csharp
+new TokenLimits
+{
+    DailyTotalTokens    = 10_000,   // hard deny at this — 0 = unlimited
+    DailyWarnAt         = 8_000,    // soft warning, turn still runs — 0 = no warning
+    LifetimeTotalTokens = 100_000,  // all-time hard deny — 0 = unlimited
+}
+```
+
+#### Setting up the policy
+
+```csharp
+var policy = new ConfigurableTokenPolicy(
+    defaults: new TokenLimits
+    {
+        DailyTotalTokens = 10_000,
+        DailyWarnAt      = 8_000,
+    });
+
+// Per-user overrides (set at runtime, no restart needed)
+policy.SetUserLimit("premium-user-id", new TokenLimits { DailyTotalTokens = 100_000 });
+policy.SetUserLimit("internal-bot",    TokenLimits.Unlimited);
+```
+
+#### Wiring into SessionManager
+
+```csharp
+var manager = new SessionManager(
+    store:        conversationStore,
+    agentFactory: () => BuildAgentLoop(),
+    ledger:       new PostgresTokenLedger(connStr),   // or InMemoryTokenLedger
+    policy:       policy
+);
+
+// RunAsync now returns SessionTurnResult
+var result = await manager.RunAsync(sessionKey, userMessage, userId: "123", channel: "telegram");
+
+if (result.WasDenied)
+{
+    // result.PolicyResult.Message = "Daily token limit reached (10,000 / 10,000). Try again tomorrow."
+    await SendToUser(result.PolicyResult.Message!);
+    return;
+}
+
+if (result.HasWarning)
+{
+    // Still ran — prepend the warning to the response
+    await SendToUser($"{result.PolicyResult.Message}\n\n{result.Text}");
+}
+else
+{
+    await SendToUser(result.Text!);
+}
+
+// result.Usage shows what this turn consumed
+Console.WriteLine($"Turn used {result.Usage.TotalTokens} tokens");
+```
+
+#### Outcomes
+
+| Outcome | `IsAllowed` | Behavior |
+|---|---|---|
+| `Allow` | ✅ | Turn runs normally |
+| `Warn` | ✅ | Turn runs; `Message` contains warning text |
+| `Deny` | ❌ | Turn blocked; `Text` is null; `Message` is user-facing |
+
+---
+
+### CLI output
+
+When using the interactive REPL, token usage is shown after each turn:
+
+```
+Agent [github-copilot]: Here's what I found...
+  [342+128=470 tokens]
+```
+
+---
+
+### Custom policy
+
+Implement `ITokenPolicy` for advanced rules (subscription tiers, per-model pricing, time-of-day quotas):
+
+```csharp
+public class SubscriptionPolicy : ITokenPolicy
+{
+    public async Task<TokenPolicyResult> CheckAsync(
+        string userId, string channel,
+        ITokenLedger ledger, CancellationToken ct = default)
+    {
+        var tier  = await _db.GetUserTierAsync(userId);
+        var today = await ledger.GetTodayAsync(userId, channel, ct);
+
+        var dailyLimit = tier switch
+        {
+            "free"    => 5_000,
+            "pro"     => 50_000,
+            "enterprise" => int.MaxValue,
+            _ => 0
+        };
+
+        if (dailyLimit == 0)
+            return TokenPolicyResult.Deny("No active subscription.");
+
+        if (today.TotalTokens >= dailyLimit)
+            return TokenPolicyResult.Deny($"Daily limit reached for {tier} tier.");
+
+        return TokenPolicyResult.Allow();
+    }
+}
+```
 
 ---
 
