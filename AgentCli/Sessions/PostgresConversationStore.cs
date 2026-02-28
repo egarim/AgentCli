@@ -298,6 +298,35 @@ public class PostgresConversationStore : IConversationStore, IAsyncDisposable
                 active         BOOLEAN     NOT NULL DEFAULT TRUE
             );
 
+            -- Soul — single row "sivar-ai", written by admins only
+            CREATE TABLE IF NOT EXISTS agentcli.souls (
+                agent_type   TEXT        PRIMARY KEY,  -- "sivar-ai"
+                name         TEXT        NOT NULL,
+                prompt       TEXT        NOT NULL,
+                version      INTEGER     NOT NULL DEFAULT 1,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by   TEXT
+            );
+
+            -- Agent memory — shared world knowledge, written by admins
+            CREATE TABLE IF NOT EXISTS agentcli.agent_memory (
+                key          TEXT        PRIMARY KEY,
+                content      TEXT        NOT NULL,
+                tags         TEXT[]      NOT NULL DEFAULT '{}',
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            -- User memory — hard-isolated per (user_id, channel)
+            CREATE TABLE IF NOT EXISTS agentcli.user_memory (
+                user_id      TEXT        NOT NULL,
+                channel      TEXT        NOT NULL,
+                key          TEXT        NOT NULL,
+                value        TEXT        NOT NULL,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, channel, key)
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_messages_session_pos
                 ON agentcli.messages (session_key, position);
@@ -317,6 +346,11 @@ public class PostgresConversationStore : IConversationStore, IAsyncDisposable
 
             CREATE INDEX IF NOT EXISTS idx_agents_status
                 ON agentcli.agents (status);
+            CREATE INDEX IF NOT EXISTS idx_agent_memory_tags
+                ON agentcli.agent_memory USING GIN (tags);
+
+            CREATE INDEX IF NOT EXISTS idx_user_memory_user
+                ON agentcli.user_memory (user_id, channel);
             """;
         await cmd.ExecuteNonQueryAsync(ct);
     }
