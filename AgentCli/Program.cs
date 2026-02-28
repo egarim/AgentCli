@@ -23,21 +23,18 @@ async Task SaveGitHubTokenAsync(string token)
 // ─── Memory + Soul ────────────────────────────────────────────────────────────
 var memory = MemorySystem.CreateFile();
 
-// Seed SOUL.md if it doesn't exist yet
 if (!await memory.Provider.ExistsAsync(MemorySystem.KeySoul))
 {
     await memory.WriteSoulAsync("""
         # SOUL.md
-
         You are a helpful, direct, and practical AI assistant running locally.
         You remember things the user tells you — write important facts to memory.
         Be concise. Lead with the answer. Don't pad responses.
         You have tools — use them when helpful, not speculatively.
         """);
-    Console.WriteLine($"Created SOUL.md — edit it to change the agent's personality.");
+    Console.WriteLine("Created SOUL.md — edit it to change the agent's personality.");
 }
 
-// Seed WORKFLOW_AUTO.md if it doesn't exist yet
 if (!await memory.Provider.ExistsAsync(MemorySystem.KeyWorkflow))
 {
     await memory.WriteWorkflowAutoAsync("""
@@ -49,7 +46,7 @@ if (!await memory.Provider.ExistsAsync(MemorySystem.KeyWorkflow))
         - MEMORY.md
         - memory/YYYY-MM-DD.md
         """);
-    Console.WriteLine($"Created WORKFLOW_AUTO.md — edit it to control startup reads.");
+    Console.WriteLine("Created WORKFLOW_AUTO.md — edit it to control startup reads.");
 }
 
 // ─── Services ─────────────────────────────────────────────────────────────────
@@ -57,7 +54,7 @@ var http         = new HttpClient();
 var deviceAuth   = new GitHubDeviceAuth(http);
 var tokenService = new CopilotTokenService(http);
 
-// ─── Login ────────────────────────────────────────────────────────────────────
+// ─── GitHub Copilot login ─────────────────────────────────────────────────────
 var githubToken = await LoadGitHubTokenAsync();
 
 if (githubToken == null || args.Contains("--login"))
@@ -70,7 +67,8 @@ if (githubToken == null || args.Contains("--login"))
     Console.WriteLine($"  2. Enter: {device.UserCode}");
     Console.ResetColor();
     Console.WriteLine();
-    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = device.VerificationUri, UseShellExecute = true }); }
+    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        { FileName = device.VerificationUri, UseShellExecute = true }); }
     catch { }
     Console.Write("Waiting for authorization");
     githubToken = await deviceAuth.PollForAccessTokenAsync(device);
@@ -78,183 +76,142 @@ if (githubToken == null || args.Contains("--login"))
     await SaveGitHubTokenAsync(githubToken);
 }
 
-// ─── Build system prompt with memory context ──────────────────────────────────
+// ─── Provider registry ────────────────────────────────────────────────────────
+var registry = ProviderRegistry.FromEnvironment(http, tokenService, githubToken);
+
+// Honour --provider <id> flag
+var providerArg = args.SkipWhile(a => a != "--provider").Skip(1).FirstOrDefault();
+if (providerArg != null)
+{
+    try { registry.SetActive(providerArg); }
+    catch (Exception ex) { Console.WriteLine($"Warning: {ex.Message}"); }
+}
+
+// ─── System prompt ────────────────────────────────────────────────────────────
 var memoryContext = await memory.BuildContextAsync();
-var systemPrompt = string.IsNullOrWhiteSpace(memoryContext)
+var systemPrompt  = string.IsNullOrWhiteSpace(memoryContext)
     ? "You are a helpful AI assistant."
     : $"""
       {memoryContext}
 
       ---
-
-      You have access to tools. Use memory_write to remember important things
-      the user tells you. Use memory_search to recall past conversations.
-      Be direct and concise.
+      You have access to tools. Use memory_write to remember important things the user tells you.
+      Use memory_search to recall past conversations. Be direct and concise.
       """;
 
-// ─── Build agent ──────────────────────────────────────────────────────────────
-var chatClient = new CopilotChatClient(http, tokenService, githubToken) { Model = "claude-sonnet-4.5" };
-var agent = new AgentLoop(chatClient, systemPrompt);
+// ─── Agent (rebuilt on /switch) ───────────────────────────────────────────────
+AgentLoop BuildAgent() => new AgentLoop(registry.Active, systemPrompt,
+    args.SkipWhile(a => a != "--model").Skip(1).FirstOrDefault());
 
-// ─── Tools ────────────────────────────────────────────────────────────────────
+var agent = BuildAgent();
 
-agent.RegisterTool(
-    name: "get_time",
-    description: "Returns the current local date and time",
-    schema: new { type = "object", properties = new { } },
-    handler: _ => Task.FromResult(DateTime.Now.ToString("F"))
-);
+// ─── Tool registration helper ─────────────────────────────────────────────────
+void RegisterTools(AgentLoop a)
+{
+    a.RegisterTool("get_time", "Returns the current local date and time",
+        new { type = "object", properties = new { } },
+        _ => Task.FromResult(DateTime.Now.ToString("F")));
 
-agent.RegisterTool(
-    name: "web_fetch",
-    description: "Fetches plain text content from a URL",
-    schema: new
-    {
-        type = "object",
-        properties = new { url = new { type = "string", description = "URL to fetch" } },
-        required = new[] { "url" }
-    },
-    handler: async args =>
-    {
-        var url = args.GetProperty("url").GetString()!;
-        using var wh = new HttpClient();
-        wh.DefaultRequestHeaders.Add("User-Agent", "AgentCli/1.0");
-        var html = await wh.GetStringAsync(url);
-        return html.Length > 2000 ? html[..2000] + "\n...(truncated)" : html;
-    }
-);
-
-agent.RegisterTool(
-    name: "memory_write",
-    description: "Saves an important fact or note to long-term memory (MEMORY.md). Use this to remember things the user tells you — name, preferences, context, decisions.",
-    schema: new
-    {
-        type = "object",
-        properties = new
+    a.RegisterTool("web_fetch", "Fetches plain text content from a URL",
+        new { type = "object",
+              properties = new { url = new { type = "string" } },
+              required   = new[] { "url" } },
+        async args2 =>
         {
-            section = new { type = "string", description = "Short section heading, e.g. 'User Preferences' or 'Project Context'" },
-            content = new { type = "string", description = "What to remember" }
-        },
-        required = new[] { "section", "content" }
-    },
-    handler: async args =>
-    {
-        var section = args.GetProperty("section").GetString()!;
-        var content = args.GetProperty("content").GetString()!;
-        await memory.AppendMemoryAsync(section, content);
-        return $"Saved to memory: [{section}]";
-    }
-);
+            var url = args2.GetProperty("url").GetString()!;
+            using var wh = new HttpClient();
+            wh.DefaultRequestHeaders.Add("User-Agent", "AgentCli/1.0");
+            var html = await wh.GetStringAsync(url);
+            return html.Length > 2000 ? html[..2000] + "\n...(truncated)" : html;
+        });
 
-agent.RegisterTool(
-    name: "memory_search",
-    description: "Search your memory files for relevant past context",
-    schema: new
-    {
-        type = "object",
-        properties = new
+    a.RegisterTool("memory_write",
+        "Saves an important fact to long-term memory (MEMORY.md)",
+        new { type = "object",
+              properties = new
+              {
+                  section = new { type = "string" },
+                  content = new { type = "string" }
+              },
+              required = new[] { "section", "content" } },
+        async args2 =>
         {
-            query = new { type = "string", description = "Search query" }
-        },
-        required = new[] { "query" }
-    },
-    handler: async args =>
-    {
-        var query = args.GetProperty("query").GetString()!;
-        var results = await memory.SearchAsync(query, maxResults: 5);
-        if (results.Count == 0) return "No memory found for that query.";
-        var sb = new StringBuilder();
-        foreach (var r in results)
+            await memory.AppendMemoryAsync(
+                args2.GetProperty("section").GetString()!,
+                args2.GetProperty("content").GetString()!);
+            return $"Saved to memory: [{args2.GetProperty("section").GetString()}]";
+        });
+
+    a.RegisterTool("memory_search", "Search memory for relevant past context",
+        new { type = "object",
+              properties = new { query = new { type = "string" } },
+              required   = new[] { "query" } },
+        async args2 =>
         {
-            sb.AppendLine($"[{Path.GetFileName(r.Path)}:{r.Line}] (score {r.Score:F2})");
-            sb.AppendLine(r.Snippet);
-            sb.AppendLine();
-        }
-        return sb.ToString().Trim();
-    }
-);
+            var results = await memory.SearchAsync(args2.GetProperty("query").GetString()!, 5);
+            if (results.Count == 0) return "No memory found.";
+            var sb2 = new StringBuilder();
+            foreach (var r in results)
+            {
+                sb2.AppendLine($"[{Path.GetFileName(r.Path)}:{r.Line}] score={r.Score:F2}");
+                sb2.AppendLine(r.Snippet);
+                sb2.AppendLine();
+            }
+            return sb2.ToString().Trim();
+        });
 
-agent.RegisterTool(
-    name: "memory_read_all",
-    description: "Read the full contents of MEMORY.md",
-    schema: new { type = "object", properties = new { } },
-    handler: async _ =>
-    {
-        var content = await memory.ReadMemoryAsync();
-        return content ?? "(MEMORY.md is empty)";
-    }
-);
+    a.RegisterTool("memory_read_all", "Read the full contents of MEMORY.md",
+        new { type = "object", properties = new { } },
+        async _ => await memory.ReadMemoryAsync() ?? "(empty)");
 
-agent.RegisterTool(
-    name: "daily_note",
-    description: "Append a note to today's daily log (memory/YYYY-MM-DD.md)",
-    schema: new
-    {
-        type = "object",
-        properties = new
+    a.RegisterTool("daily_note", "Append a note to today's daily log",
+        new { type = "object",
+              properties = new { content = new { type = "string" } },
+              required   = new[] { "content" } },
+        async args2 =>
         {
-            content = new { type = "string", description = "Note to append to today's log" }
-        },
-        required = new[] { "content" }
-    },
-    handler: async args =>
-    {
-        var content = args.GetProperty("content").GetString()!;
-        await memory.AppendDailyAsync(content);
-        return $"Appended to daily note ({DateTime.Today:yyyy-MM-dd})";
-    }
-);
+            await memory.AppendDailyAsync(args2.GetProperty("content").GetString()!);
+            return $"Appended to daily note ({DateTime.Today:yyyy-MM-dd})";
+        });
 
-agent.RegisterTool(
-    name: "workflow_auto_read",
-    description: "Read the current WORKFLOW_AUTO.md — shows which files are loaded on startup",
-    schema: new { type = "object", properties = new { } },
-    handler: async _ =>
-    {
-        var content = await memory.ReadWorkflowAutoAsync();
-        return content ?? "(WORKFLOW_AUTO.md does not exist)";
-    }
-);
+    a.RegisterTool("workflow_auto_read", "Read WORKFLOW_AUTO.md",
+        new { type = "object", properties = new { } },
+        async _ => await memory.ReadWorkflowAutoAsync() ?? "(not found)");
 
-agent.RegisterTool(
-    name: "workflow_auto_write",
-    description: "Overwrite WORKFLOW_AUTO.md with new content. Use to add/remove required startup file reads.",
-    schema: new
-    {
-        type = "object",
-        properties = new
+    a.RegisterTool("workflow_auto_write", "Overwrite WORKFLOW_AUTO.md",
+        new { type = "object",
+              properties = new { content = new { type = "string" } },
+              required   = new[] { "content" } },
+        async args2 =>
         {
-            content = new { type = "string", description = "Full new content for WORKFLOW_AUTO.md" }
-        },
-        required = new[] { "content" }
-    },
-    handler: async args =>
-    {
-        var content = args.GetProperty("content").GetString()!;
-        await memory.WriteWorkflowAutoAsync(content);
-        return "WORKFLOW_AUTO.md updated.";
-    }
-);
+            await memory.WriteWorkflowAutoAsync(args2.GetProperty("content").GetString()!);
+            return "WORKFLOW_AUTO.md updated.";
+        });
+}
 
-// ─── REPL ─────────────────────────────────────────────────────────────────────
+RegisterTools(agent);
+
+// ─── Banner ───────────────────────────────────────────────────────────────────
 Console.WriteLine();
 Console.ForegroundColor = ConsoleColor.Green;
 Console.WriteLine("AgentCli ready. Type your message (Ctrl+C to exit, 'exit' to quit)");
-Console.WriteLine($"Workspace: {memory.WorkspaceDir ?? "(in-memory)"} [{memory.ProviderName}]");
+Console.WriteLine($"Workspace : {memory.WorkspaceDir ?? "(in-memory)"} [{memory.ProviderName}]");
+Console.ForegroundColor = ConsoleColor.Cyan;
+Console.WriteLine($"Provider  : {registry.Active.DisplayName} ({registry.Active.Id}) — model: {args.SkipWhile(a => a != "--model").Skip(1).FirstOrDefault() ?? registry.Active.DefaultModel}");
 
-// Show which startup files were loaded
 var startupLoaded = await memory.RunStartupReadsAsync();
 if (startupLoaded.Count > 0)
 {
     Console.ForegroundColor = ConsoleColor.DarkGray;
-    Console.WriteLine($"Startup reads ({startupLoaded.Count}): {string.Join(", ", startupLoaded.Select(f => f.RelativePath))}");
+    Console.WriteLine($"Startup   : {string.Join(", ", startupLoaded.Select(f => f.RelativePath))}");
 }
 
 Console.ForegroundColor = ConsoleColor.DarkGray;
-Console.WriteLine("Commands: /memory  /soul  /daily  /workflow");
+Console.WriteLine("Commands  : /memory  /soul  /daily  /workflow  /providers  /switch <id>");
 Console.ResetColor();
 Console.WriteLine();
 
+// ─── REPL ─────────────────────────────────────────────────────────────────────
 while (true)
 {
     Console.ForegroundColor = ConsoleColor.White;
@@ -265,52 +222,68 @@ while (true)
     if (string.IsNullOrEmpty(input)) continue;
     if (input.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
 
-    // Local commands
+    // ── Built-in commands ──────────────────────────────────────────────────────
+
     if (input == "/memory")
     {
-        var content = await memory.ReadMemoryAsync();
         Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(content ?? "(empty)");
-        Console.ResetColor();
-        Console.WriteLine();
-        continue;
+        Console.WriteLine(await memory.ReadMemoryAsync() ?? "(empty)");
+        Console.ResetColor(); Console.WriteLine(); continue;
     }
     if (input == "/soul")
     {
-        var content = await memory.ReadSoulAsync();
         Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(content ?? "(empty)");
-        Console.ResetColor();
-        Console.WriteLine();
-        continue;
-    }
-    if (input == "/workflow")
-    {
-        var content = await memory.ReadWorkflowAutoAsync();
-        Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(content ?? "(WORKFLOW_AUTO.md not found)");
-        Console.ResetColor();
-        Console.WriteLine();
-        continue;
+        Console.WriteLine(await memory.ReadSoulAsync() ?? "(empty)");
+        Console.ResetColor(); Console.WriteLine(); continue;
     }
     if (input == "/daily")
     {
-        var content = await memory.ReadDailyAsync();
         Console.ForegroundColor = ConsoleColor.DarkCyan;
-        Console.WriteLine(content ?? "(no daily note today)");
-        Console.ResetColor();
-        Console.WriteLine();
-        continue;
+        Console.WriteLine(await memory.ReadDailyAsync() ?? "(no daily note today)");
+        Console.ResetColor(); Console.WriteLine(); continue;
+    }
+    if (input == "/workflow")
+    {
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.WriteLine(await memory.ReadWorkflowAutoAsync() ?? "(not found)");
+        Console.ResetColor(); Console.WriteLine(); continue;
+    }
+    if (input == "/providers")
+    {
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.WriteLine("Available providers:");
+        foreach (var p in registry.All)
+        {
+            var active = p.Id == registry.ActiveId ? " ◀ active" : "";
+            Console.WriteLine($"  {p.Id,-20} {p.DisplayName} (default model: {p.DefaultModel}){active}");
+        }
+        Console.ResetColor(); Console.WriteLine(); continue;
+    }
+    if (input.StartsWith("/switch "))
+    {
+        var newId = input["/switch ".Length..].Trim();
+        try
+        {
+            registry.SetActive(newId);
+            agent = BuildAgent();
+            RegisterTools(agent);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"Switched to: {registry.Active.DisplayName} ({registry.Active.Id})");
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+        Console.ResetColor(); Console.WriteLine(); continue;
     }
 
+    // ── Agent turn ────────────────────────────────────────────────────────────
     Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("Agent: ");
+    Console.Write($"Agent [{registry.Active.Id}]: ");
     Console.ResetColor();
 
-    try
-    {
-        await agent.RunAsync(input);
-    }
+    try { await agent.RunAsync(input); }
     catch (Exception ex)
     {
         Console.ForegroundColor = ConsoleColor.Red;

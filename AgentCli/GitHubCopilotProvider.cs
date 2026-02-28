@@ -7,59 +7,30 @@ using System.Text.Json.Serialization;
 
 namespace AgentCli;
 
-// ─── Message types ────────────────────────────────────────────────────────────
-
-public record ChatMessage(
-    [property: JsonPropertyName("role")]         string Role,
-    [property: JsonPropertyName("content")]      string? Content,
-    [property: JsonPropertyName("tool_calls")]   List<ToolCall>? ToolCalls    = null,
-    [property: JsonPropertyName("tool_call_id")] string?         ToolCallId   = null
-);
-
-public record ToolCall(
-    [property: JsonPropertyName("id")]       string           Id,
-    [property: JsonPropertyName("type")]     string           Type,
-    [property: JsonPropertyName("function")] ToolCallFunction Function
-);
-
-public record ToolCallFunction(
-    [property: JsonPropertyName("name")]      string Name,
-    [property: JsonPropertyName("arguments")] string Arguments
-);
-
-public record ToolDefinition(
-    [property: JsonPropertyName("type")]     string          Type,
-    [property: JsonPropertyName("function")] ToolFunctionDef Function
-);
-
-public record ToolFunctionDef(
-    [property: JsonPropertyName("name")]        string Name,
-    [property: JsonPropertyName("description")] string Description,
-    [property: JsonPropertyName("parameters")]  object Parameters
-);
-
-// ─── Chat client ──────────────────────────────────────────────────────────────
-
 /// <summary>
-/// Streams from GitHub Copilot chat completions endpoint (OpenAI-compatible).
-/// Yields raw SSE data lines — caller parses JSON.
+/// GitHub Copilot provider — device auth + short-lived token exchange.
+/// Wraps CopilotTokenService to implement IAiProvider.
 /// </summary>
-public class CopilotChatClient
+public class GitHubCopilotProvider : IAiProvider
 {
     private readonly HttpClient          _http;
     private readonly CopilotTokenService _tokenService;
     private readonly string              _githubToken;
-    public  string                       Model { get; set; } = "claude-sonnet-4.5";
 
-    public CopilotChatClient(HttpClient http, CopilotTokenService tokenService, string githubToken)
+    public GitHubCopilotProvider(HttpClient http, CopilotTokenService tokenService, string githubToken)
     {
         _http         = http;
         _tokenService = tokenService;
         _githubToken  = githubToken;
     }
 
+    public string Id           => "github-copilot";
+    public string DisplayName  => "GitHub Copilot";
+    public string DefaultModel => "claude-sonnet-4.5";
+
     public async IAsyncEnumerable<string> StreamAsync(
-        List<ChatMessage>    messages,
+        List<ChatMessage>     messages,
+        string                model,
         List<ToolDefinition>? tools = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -67,7 +38,7 @@ public class CopilotChatClient
 
         var body = new Dictionary<string, object>
         {
-            ["model"]      = Model,
+            ["model"]      = model,
             ["messages"]   = messages,
             ["stream"]     = true,
             ["max_tokens"] = 4096,
@@ -78,7 +49,7 @@ public class CopilotChatClient
         var req = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/chat/completions");
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
         req.Headers.Add("Accept", "text/event-stream");
-        // Required by Copilot API — same headers OpenClaw sends
+        req.Headers.Add("User-Agent", "AgentCli/1.0");
         req.Headers.Add("Copilot-Integration-Id",  "vscode-chat");
         req.Headers.Add("Editor-Version",           "vscode/1.96.0");
         req.Headers.Add("Editor-Plugin-Version",    "copilot-chat/0.23.0");
@@ -93,7 +64,7 @@ public class CopilotChatClient
         if (!res.IsSuccessStatusCode)
         {
             var err = await res.Content.ReadAsStringAsync(ct);
-            throw new Exception($"Copilot API error: HTTP {(int)res.StatusCode} — {err}");
+            throw new Exception($"[github-copilot] HTTP {(int)res.StatusCode}: {err}");
         }
 
         using var stream = await res.Content.ReadAsStreamAsync(ct);

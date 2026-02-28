@@ -6,18 +6,21 @@ namespace AgentCli;
 
 /// <summary>
 /// Simple agentic loop: send message → stream response → execute tools → repeat.
+/// Provider-agnostic — works with any IAiProvider.
 /// </summary>
 public class AgentLoop
 {
-    private readonly CopilotChatClient _client;
+    private readonly IAiProvider       _provider;
+    private readonly string            _model;
     private readonly List<ChatMessage> _history = new();
 
     private readonly Dictionary<string, (ToolDefinition Def, Func<JsonElement, Task<string>> Handler)>
         _tools = new();
 
-    public AgentLoop(CopilotChatClient client, string systemPrompt)
+    public AgentLoop(IAiProvider provider, string systemPrompt, string? model = null)
     {
-        _client = client;
+        _provider = provider;
+        _model    = model ?? provider.DefaultModel;
         _history.Add(new ChatMessage("system", systemPrompt));
     }
 
@@ -47,7 +50,7 @@ public class AgentLoop
             var sb    = new StringBuilder();
             List<ToolCall>? pendingCalls = null;
 
-            await foreach (var chunk in _client.StreamAsync(_history, tools, ct))
+            await foreach (var chunk in _provider.StreamAsync(_history, _model, tools, ct))
             {
                 JsonNode? doc;
                 try { doc = JsonNode.Parse(chunk); }
@@ -56,14 +59,12 @@ public class AgentLoop
                 var delta = doc?["choices"]?[0]?["delta"];
                 if (delta == null) continue;
 
-                // Stream text to console
                 if (delta["content"]?.GetValue<string>() is { } text)
                 {
                     Console.Write(text);
                     sb.Append(text);
                 }
 
-                // Accumulate streaming tool call chunks
                 if (delta["tool_calls"] is JsonArray tcArray)
                 {
                     pendingCalls ??= new();
@@ -80,8 +81,7 @@ public class AgentLoop
                             Id = callChunk?["id"]?.GetValue<string>() ?? existing.Id,
                             Function = existing.Function with
                             {
-                                Name = fn?["name"]?.GetValue<string>()
-                                       ?? existing.Function.Name,
+                                Name = fn?["name"]?.GetValue<string>() ?? existing.Function.Name,
                                 Arguments = existing.Function.Arguments
                                             + (fn?["arguments"]?.GetValue<string>() ?? ""),
                             }
@@ -90,17 +90,14 @@ public class AgentLoop
                 }
             }
 
-            // Add assistant message to history
             _history.Add(new ChatMessage("assistant", sb.ToString(), pendingCalls));
 
-            // No tool calls → done
             if (pendingCalls == null || pendingCalls.Count == 0)
             {
                 Console.WriteLine();
                 return sb.ToString();
             }
 
-            // Execute tools and feed results back
             Console.WriteLine();
             foreach (var call in pendingCalls)
             {
@@ -118,10 +115,7 @@ public class AgentLoop
                         ).RootElement;
                         result = await entry.Handler(args);
                     }
-                    catch (Exception ex)
-                    {
-                        result = $"Error: {ex.Message}";
-                    }
+                    catch (Exception ex) { result = $"Error: {ex.Message}"; }
                 }
                 else
                 {
@@ -134,7 +128,6 @@ public class AgentLoop
 
                 _history.Add(new ChatMessage("tool", result, ToolCallId: call.Id));
             }
-            // Loop — model sees tool results and continues
         }
     }
 }
