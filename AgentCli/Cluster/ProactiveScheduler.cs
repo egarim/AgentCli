@@ -93,7 +93,8 @@ public sealed class AgentTurnHandler : IProactiveHandler
             : SessionKey.Direct(evt.Channel, evt.UserId);
 
         // Run full AI turn — SessionManager handles history, compaction, etc.
-        var reply = await _sessions.RunAsync(sessionKey, prompt, ct);
+        var turnResult = await _sessions.RunAsync(sessionKey, prompt, ct: ct);
+        var reply = turnResult.Text ?? "";
 
         if (!string.IsNullOrWhiteSpace(reply))
         {

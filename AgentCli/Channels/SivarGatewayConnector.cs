@@ -73,7 +73,10 @@ public sealed class SivarGatewayConnector : IChannelConnector
         CancellationToken   ct)
     {
         var sessionKey = SessionKey.Direct(request.Context.Channel, request.UserId);
-        var reply      = await sessions.RunAsync(sessionKey, request.Message, ct);
+        var turnResult = await sessions.RunAsync(sessionKey, request.Message, ct: ct);
+        var reply      = turnResult.WasDenied
+            ? (turnResult.PolicyResult.Message ?? "Request denied.")
+            : (turnResult.Text ?? "");
         return new GatewayAgentResponse(
             Replies: [new GatewayAgentReply(reply)],
             ConversationState: "active");

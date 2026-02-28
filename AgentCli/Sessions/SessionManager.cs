@@ -45,19 +45,18 @@ public class CompactionOptions
 ///   - Maintain a per-session AgentLoop with the right message history
 ///   - Persist new messages after each turn
 ///   - Compact when history exceeds configured limits
+///   - Enforce token policy (check before turn, record after)
 ///
 /// Each session gets its own AgentLoop instance (with its own history list).
 /// SessionManager acts as the factory and cache for those loops.
-///
-/// Usage:
-///   var manager = new SessionManager(store, agentFactory, options);
-///   var response = await manager.RunAsync("telegram:direct:5932684607", userMessage);
 /// </summary>
 public class SessionManager : IDisposable
 {
     private readonly IConversationStore  _store;
     private readonly Func<AgentLoop>     _agentFactory;
     private readonly CompactionOptions   _compaction;
+    private readonly ITokenLedger?       _ledger;
+    private readonly ITokenPolicy?       _policy;
 
     // Active loops keyed by sessionKey
     private readonly ConcurrentDictionary<string, SessionState> _active = new(StringComparer.OrdinalIgnoreCase);
@@ -78,11 +77,15 @@ public class SessionManager : IDisposable
     public SessionManager(
         IConversationStore  store,
         Func<AgentLoop>     agentFactory,
-        CompactionOptions?  compaction = null)
+        CompactionOptions?  compaction = null,
+        ITokenLedger?       ledger     = null,
+        ITokenPolicy?       policy     = null)
     {
         _store        = store;
         _agentFactory = agentFactory;
         _compaction   = compaction ?? new CompactionOptions();
+        _ledger       = ledger;
+        _policy       = policy;
     }
 
     // ─── Main API ─────────────────────────────────────────────────────────────
@@ -90,37 +93,71 @@ public class SessionManager : IDisposable
     /// <summary>
     /// Send a user message in the given session and return the agent's response.
     /// Loads or resumes the session automatically.
+    ///
+    /// Returns null if the token policy denied the turn — caller should deliver
+    /// the denial message from the TokenPolicyResult to the user.
     /// </summary>
-    public async Task<string> RunAsync(
+    public async Task<SessionTurnResult> RunAsync(
         string            sessionKey,
         string            userMessage,
-        CancellationToken ct = default)
+        string?           userId  = null,
+        string?           channel = null,
+        CancellationToken ct      = default)
     {
+        // Derive userId/channel from sessionKey if not supplied
+        userId  ??= ExtractUserId(sessionKey);
+        channel ??= ExtractChannel(sessionKey);
+
+        // ── Policy check ──────────────────────────────────────────────────────
+        if (_policy != null && _ledger != null && userId != null && channel != null)
+        {
+            var check = await _policy.CheckAsync(userId, channel, _ledger, ct);
+            if (!check.IsAllowed)
+                return new SessionTurnResult(null, TokenUsage.Zero, check);
+
+            // Warn: surface to caller but continue
+            if (check.Outcome == TokenPolicyOutcome.Warn)
+            {
+                var state2 = await GetOrLoadAsync(sessionKey, ct);
+                state2.LastUsed = DateTimeOffset.UtcNow;
+                var userMsg2 = new ChatMessage("user", userMessage);
+                state2.Session.Messages.Add(userMsg2);
+                await _store.AppendMessageAsync(sessionKey, userMsg2, ct);
+                SyncLoopHistory(state2);
+                var result2 = await state2.Loop.RunAsync(userMessage, ct);
+                await SyncNewMessagesAsync(state2, ct);
+                await MaybeCompactAsync(state2, ct);
+                if (_ledger != null && userId != null && channel != null)
+                    await _ledger.RecordAsync(userId, channel, result2.Usage,
+                        state2.Loop.Model, state2.Loop.Provider.Id, ct);
+                return new SessionTurnResult(result2.Text, result2.Usage, check);
+            }
+        }
+
+        // ── Normal turn ───────────────────────────────────────────────────────
         var state = await GetOrLoadAsync(sessionKey, ct);
         state.LastUsed = DateTimeOffset.UtcNow;
 
-        // Persist user message first (crash-safe)
         var userMsg = new ChatMessage("user", userMessage);
         state.Session.Messages.Add(userMsg);
         await _store.AppendMessageAsync(sessionKey, userMsg, ct);
 
-        // Run the loop (AgentLoop also appends to its internal _history)
-        // We sync AgentLoop history from our session before running
         SyncLoopHistory(state);
-        var response = await state.Loop.RunAsync(userMessage, ct);
+        var agentResult = await state.Loop.RunAsync(userMessage, ct);
 
-        // Persist assistant (+ any tool) messages added during the turn
         await SyncNewMessagesAsync(state, ct);
-
-        // Compact if needed
         await MaybeCompactAsync(state, ct);
 
-        return response;
+        // ── Record usage ──────────────────────────────────────────────────────
+        if (_ledger != null && userId != null && channel != null)
+            await _ledger.RecordAsync(userId, channel, agentResult.Usage,
+                state.Loop.Model, state.Loop.Provider.Id, ct);
+
+        return new SessionTurnResult(agentResult.Text, agentResult.Usage, TokenPolicyResult.Allow());
     }
 
     /// <summary>
     /// Load a session's metadata + history without running a turn.
-    /// Useful for inspecting or preloading a session.
     /// </summary>
     public async Task<ConversationSession> GetSessionAsync(string sessionKey, CancellationToken ct = default)
         => (await GetOrLoadAsync(sessionKey, ct)).Session;
@@ -157,9 +194,6 @@ public class SessionManager : IDisposable
 
         var loop = _agentFactory();
 
-        // Replay stored history into the fresh loop
-        // AgentLoop always starts with the system prompt already in _history[0]
-        // We inject the stored user/assistant/tool messages after it
         foreach (var msg in session.Messages)
             loop.InjectMessage(msg);
 
@@ -170,29 +204,15 @@ public class SessionManager : IDisposable
 
     // ─── History sync ─────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Sync our session's message list → AgentLoop before a turn.
-    /// The loop may have drifted if we injected compaction summaries externally.
-    /// </summary>
     private static void SyncLoopHistory(SessionState state)
     {
-        // AgentLoop owns its history — we only need to ensure the user message
-        // we're about to send isn't already there (we added it to session.Messages above
-        // but haven't called loop.RunAsync yet, so nothing to sync here).
-        // Full sync only happens on load (GetOrLoadAsync).
+        // No-op: full sync only happens on load (GetOrLoadAsync).
     }
 
-    /// <summary>
-    /// After a turn completes, sync new messages the loop appended back to our session
-    /// and persist them.
-    /// </summary>
     private async Task SyncNewMessagesAsync(SessionState state, CancellationToken ct)
     {
-        // AgentLoop._history has the full history including the system prompt.
-        // Our session.Messages has user+assistant+tool only.
-        // The delta = messages added during this turn (assistant + any tool results).
-        var loopMsgs     = state.Loop.ExportHistory();         // all messages including system
-        var sessionCount = state.Session.Messages.Count;      // already includes the user msg we added
+        var loopMsgs         = state.Loop.ExportHistory();
+        var sessionCount     = state.Session.Messages.Count;
         var loopUserAsstMsgs = loopMsgs.Where(m => m.Role != "system").ToList();
 
         for (int i = sessionCount; i < loopUserAsstMsgs.Count; i++)
@@ -228,13 +248,11 @@ public class SessionManager : IDisposable
         var session = state.Session;
         var history = state.Loop.ExportHistory();
 
-        // Build compaction prompt: system + all messages → ask for summary
         var compactionMessages = new List<ChatMessage>(history)
         {
             new("user", _compaction.CompactionPrompt)
         };
 
-        // Run a one-shot completion (no tools, no loop)
         var sb = new System.Text.StringBuilder();
         await foreach (var chunk in state.Loop.Provider.StreamAsync(
             compactionMessages, state.Loop.Model, tools: null, ct))
@@ -249,24 +267,39 @@ public class SessionManager : IDisposable
                                .GetString();
                 if (text != null) sb.Append(text);
             }
-            catch { /* skip malformed chunks */ }
+            catch { }
         }
 
         var summary = sb.ToString().Trim();
         if (string.IsNullOrEmpty(summary)) return;
 
-        // Replace history with summary message
         session.Messages.Clear();
         session.Messages.Add(new ChatMessage("assistant",
             $"[Conversation summary — compaction #{session.CompactionCount + 1}]\n\n{summary}"));
         session.CompactionCount++;
         session.UpdatedAt = DateTimeOffset.UtcNow;
 
-        // Rebuild the loop's history from scratch
         state.Loop.ResetHistory(session.Messages);
-
-        // Persist the compacted session
         await _store.SaveAsync(session, ct);
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Extract userId from session key (format: "channel:type:userId" or "channel:userId").
+    /// Returns null if key doesn't follow that pattern.
+    /// </summary>
+    private static string? ExtractUserId(string sessionKey)
+    {
+        var parts = sessionKey.Split(':');
+        return parts.Length >= 3 ? parts[2] : null;
+    }
+
+    /// <summary>Extract channel from session key (first segment before ':').</summary>
+    private static string? ExtractChannel(string sessionKey)
+    {
+        var idx = sessionKey.IndexOf(':');
+        return idx > 0 ? sessionKey[..idx] : null;
     }
 
     public void Dispose()
@@ -274,3 +307,21 @@ public class SessionManager : IDisposable
         if (_store is IDisposable d) d.Dispose();
     }
 }
+
+// ─── Turn result ──────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Result of one SessionManager.RunAsync call.
+/// Text is null if the turn was denied by policy.
+/// </summary>
+public sealed record SessionTurnResult(
+    string?            Text,
+    TokenUsage         Usage,
+    TokenPolicyResult  PolicyResult
+)
+{
+    public bool WasDenied => !PolicyResult.IsAllowed;
+    public bool HasWarning => PolicyResult.Outcome == TokenPolicyOutcome.Warn;
+}
+
+

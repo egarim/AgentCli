@@ -458,7 +458,16 @@ public class App
         Console.Write($"Agent [{_registry.Active.Id}]: ");
         Console.ResetColor();
 
-        try   { await _agent.RunAsync(input); }
+        try
+        {
+            var result = await _agent.RunAsync(input);
+            if (result.Usage.TotalTokens > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"  [{result.Usage.PromptTokens}+{result.Usage.CompletionTokens}={result.Usage.TotalTokens} tokens]");
+                Console.ResetColor();
+            }
+        }
         catch (Exception ex) { PrintErr(ex.Message); }
 
         Console.WriteLine();

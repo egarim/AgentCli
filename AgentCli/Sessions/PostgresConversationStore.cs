@@ -356,6 +356,22 @@ public class PostgresConversationStore : IConversationStore, IAsyncDisposable
 
             CREATE INDEX IF NOT EXISTS idx_user_memory_user
                 ON agentcli.user_memory (user_id, channel);
+
+            -- Token usage ledger — one row per turn
+            CREATE TABLE IF NOT EXISTS agentcli.token_usage (
+                id                BIGSERIAL   PRIMARY KEY,
+                user_id           TEXT        NOT NULL,
+                channel           TEXT        NOT NULL,
+                prompt_tokens     INTEGER     NOT NULL DEFAULT 0,
+                completion_tokens INTEGER     NOT NULL DEFAULT 0,
+                total_tokens      INTEGER     NOT NULL DEFAULT 0,
+                model             TEXT,
+                provider          TEXT,
+                recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_token_usage_user_day
+                ON agentcli.token_usage (user_id, channel, recorded_at);
             """;
         await cmd.ExecuteNonQueryAsync(ct);
     }

@@ -102,21 +102,33 @@ public class AgentLoop
 
     // ─── Main loop ────────────────────────────────────────────────────────────
 
-    public async Task<string> RunAsync(string userMessage, CancellationToken ct = default)
+    public async Task<AgentResult> RunAsync(string userMessage, CancellationToken ct = default)
     {
         _history.Add(new ChatMessage("user", userMessage));
+
+        var accumulatedUsage = TokenUsage.Zero;
 
         while (true)
         {
             var tools = ToolDefinitions.ToList();
             var sb    = new StringBuilder();
             List<ToolCall>? pendingCalls = null;
+            TokenUsage? turnUsage = null;
 
             await foreach (var chunk in _provider.StreamAsync(_history, _model, tools, ct))
             {
                 JsonNode? doc;
                 try { doc = JsonNode.Parse(chunk); }
                 catch { continue; }
+
+                // Capture usage from the final chunk (OpenAI standard field)
+                if (doc?["usage"] is JsonNode usageNode)
+                {
+                    var pt = usageNode["prompt_tokens"]?.GetValue<int>()     ?? 0;
+                    var ct2 = usageNode["completion_tokens"]?.GetValue<int>() ?? 0;
+                    var tt = usageNode["total_tokens"]?.GetValue<int>()       ?? (pt + ct2);
+                    turnUsage = new TokenUsage(pt, ct2, tt);
+                }
 
                 var delta = doc?["choices"]?[0]?["delta"];
                 if (delta == null) continue;
@@ -152,12 +164,15 @@ public class AgentLoop
                 }
             }
 
+            if (turnUsage != null)
+                accumulatedUsage = accumulatedUsage + turnUsage;
+
             _history.Add(new ChatMessage("assistant", sb.ToString(), pendingCalls));
 
             if (pendingCalls == null || pendingCalls.Count == 0)
             {
                 Console.WriteLine();
-                return sb.ToString();
+                return new AgentResult(sb.ToString(), accumulatedUsage);
             }
 
             Console.WriteLine();

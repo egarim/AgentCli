@@ -273,7 +273,13 @@ public sealed class InboundMessageRouter : IDisposable
         await typing.StartAsync(msg.From, ct);
         try
         {
-            var response = await _sessions.RunAsync(sessionKey, msg.Text, ct);
+            var turnResult = await _sessions.RunAsync(sessionKey, msg.Text, ct: ct);
+            if (turnResult.WasDenied)
+            {
+                await ReplyAsync(msg, turnResult.PolicyResult.Message ?? "Request denied.", ct);
+                return;
+            }
+            var response = turnResult.Text ?? "";
             await typing.StopAsync(msg.From, ct);
             await ReplyChunkedAsync(msg, response, ct);
         }
