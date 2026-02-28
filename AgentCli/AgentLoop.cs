@@ -27,6 +27,41 @@ public class AgentLoop
         _history.Add(new ChatMessage("system", systemPrompt));
     }
 
+    /// <summary>Exposed for SessionManager compaction.</summary>
+    public IAiProvider Provider => _provider;
+    public string      Model    => _model;
+
+    // ─── History management (used by SessionManager) ──────────────────────────
+
+    /// <summary>
+    /// Inject a stored message into the history without adding it as a new user turn.
+    /// Used when replaying persisted messages on session resume.
+    /// Skips system messages (the loop already has one).
+    /// </summary>
+    public void InjectMessage(ChatMessage message)
+    {
+        if (message.Role == "system") return;
+        _history.Add(message);
+    }
+
+    /// <summary>
+    /// Export the full history (including system prompt) — for compaction and persistence sync.
+    /// </summary>
+    public IReadOnlyList<ChatMessage> ExportHistory() => _history.AsReadOnly();
+
+    /// <summary>
+    /// Replace the history with a new set of messages (after compaction).
+    /// The system prompt at index 0 is preserved; the rest is replaced.
+    /// </summary>
+    public void ResetHistory(IEnumerable<ChatMessage> messages)
+    {
+        var systemMsg = _history.FirstOrDefault(m => m.Role == "system");
+        _history.Clear();
+        if (systemMsg != null) _history.Add(systemMsg);
+        foreach (var m in messages.Where(m => m.Role != "system"))
+            _history.Add(m);
+    }
+
     // ─── Tool registration ────────────────────────────────────────────────────
 
     /// <summary>Register a tool with a cancellation-aware handler.</summary>
