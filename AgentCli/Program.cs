@@ -37,6 +37,21 @@ if (!File.Exists(memory.SoulPath))
     Console.WriteLine($"Created {memory.SoulPath} — edit it to change the agent's personality.");
 }
 
+// Seed WORKFLOW_AUTO.md if it doesn't exist yet
+if (!File.Exists(memory.WorkflowAutoPath))
+{
+    await memory.WriteWorkflowAutoAsync("""
+        # WORKFLOW_AUTO.md
+        # Files listed here are automatically read on every startup.
+        # Ensures protocols are restored after context resets / compaction.
+        # Supports date placeholder: memory/YYYY-MM-DD.md (resolves to today + yesterday)
+
+        - MEMORY.md
+        - memory/YYYY-MM-DD.md
+        """);
+    Console.WriteLine($"Created {memory.WorkflowAutoPath} — edit it to control startup reads.");
+}
+
 // ─── Services ─────────────────────────────────────────────────────────────────
 var http         = new HttpClient();
 var deviceAuth   = new GitHubDeviceAuth(http);
@@ -190,11 +205,53 @@ agent.RegisterTool(
     }
 );
 
+agent.RegisterTool(
+    name: "workflow_auto_read",
+    description: "Read the current WORKFLOW_AUTO.md — shows which files are loaded on startup",
+    schema: new { type = "object", properties = new { } },
+    handler: async _ =>
+    {
+        var content = await memory.ReadWorkflowAutoAsync();
+        return content ?? "(WORKFLOW_AUTO.md does not exist)";
+    }
+);
+
+agent.RegisterTool(
+    name: "workflow_auto_write",
+    description: "Overwrite WORKFLOW_AUTO.md with new content. Use to add/remove required startup file reads.",
+    schema: new
+    {
+        type = "object",
+        properties = new
+        {
+            content = new { type = "string", description = "Full new content for WORKFLOW_AUTO.md" }
+        },
+        required = new[] { "content" }
+    },
+    handler: async args =>
+    {
+        var content = args.GetProperty("content").GetString()!;
+        await memory.WriteWorkflowAutoAsync(content);
+        return "WORKFLOW_AUTO.md updated.";
+    }
+);
+
 // ─── REPL ─────────────────────────────────────────────────────────────────────
 Console.WriteLine();
 Console.ForegroundColor = ConsoleColor.Green;
 Console.WriteLine("AgentCli ready. Type your message (Ctrl+C to exit, 'exit' to quit)");
-Console.WriteLine($"Workspace: {memory.SoulPath.Replace("SOUL.md", "")}");
+Console.WriteLine($"Workspace: {memory.WorkflowAutoPath.Replace("WORKFLOW_AUTO.md", "")}");
+
+// Show which startup files were loaded
+var startupLoaded = await memory.RunStartupReadsAsync();
+if (startupLoaded.Count > 0)
+{
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"Startup reads ({startupLoaded.Count}): {string.Join(", ", startupLoaded.Select(f => f.RelativePath))}");
+}
+
+Console.ForegroundColor = ConsoleColor.DarkGray;
+Console.WriteLine("Commands: /memory  /soul  /daily  /workflow");
 Console.ResetColor();
 Console.WriteLine();
 
@@ -223,6 +280,15 @@ while (true)
         var content = await memory.ReadSoulAsync();
         Console.ForegroundColor = ConsoleColor.DarkCyan;
         Console.WriteLine(content ?? "(empty)");
+        Console.ResetColor();
+        Console.WriteLine();
+        continue;
+    }
+    if (input == "/workflow")
+    {
+        var content = await memory.ReadWorkflowAutoAsync();
+        Console.ForegroundColor = ConsoleColor.DarkCyan;
+        Console.WriteLine(content ?? "(WORKFLOW_AUTO.md not found)");
         Console.ResetColor();
         Console.WriteLine();
         continue;
