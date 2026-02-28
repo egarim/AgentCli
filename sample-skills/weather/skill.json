@@ -1,0 +1,25 @@
+{
+  "id": "weather",
+  "description": "Get current weather and forecasts via wttr.in (no API key needed)",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather for a city or location. Returns temperature, conditions, wind, and a 3-day forecast.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "City name, airport code, or coordinates (e.g. 'Berlin', 'JFK', '48.8566,2.3522')"
+          },
+          "units": {
+            "type": "string",
+            "enum": ["metric", "imperial"],
+            "description": "Temperature units — metric (°C) or imperial (°F). Default: metric."
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  ]
+}

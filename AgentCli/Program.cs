@@ -60,6 +60,7 @@ var skills = new CompositeSkillProvider(inProcess, fileSkills);
 
 // Register built-in skills (ISkill classes)
 inProcess.Register(new CoreSkill(memory));
+inProcess.Register(new ShellSkill());   // shell_exec + read_file (gate will prompt before running)
 
 // ─── Services ─────────────────────────────────────────────────────────────────
 var http         = new HttpClient();
