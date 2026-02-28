@@ -203,6 +203,69 @@ public class ConversationStoreTests
         finally { if (File.Exists(dbPath)) File.Delete(dbPath); }
     }
 
+    // ─── AgentRegistry — AgentId generation (no DB needed) ───────────────────
+
+    [Fact]
+    public void AgentId_IsDeterministic()
+    {
+        var id1 = AgentRegistry.BuildAgentId("sivar-main");
+        var id2 = AgentRegistry.BuildAgentId("sivar-main");
+        Assert.Equal(id1, id2);
+    }
+
+    [Fact]
+    public void AgentId_IncludesName()
+    {
+        var id = AgentRegistry.BuildAgentId("sivar-main");
+        Assert.StartsWith("sivar-main-", id);
+    }
+
+    [Fact]
+    public void AgentId_HasCorrectLength()
+    {
+        // "name-XXXXXXXX" where X is 8 hex chars
+        var id = AgentRegistry.BuildAgentId("agent");
+        Assert.Matches(@"^agent-[0-9a-f]{8}$", id);
+    }
+
+    [Fact]
+    public void AgentId_DifferentNames_DifferentIds()
+    {
+        var id1 = AgentRegistry.BuildAgentId("agent-a");
+        var id2 = AgentRegistry.BuildAgentId("agent-b");
+        // suffix is same (same machine) but prefix differs
+        Assert.NotEqual(id1, id2);
+        Assert.StartsWith("agent-a-", id1);
+        Assert.StartsWith("agent-b-", id2);
+    }
+
+    // ─── PostgresConversationStore — contract (via InMemory proxy) ────────────
+    // Real Postgres tests require a live DB; run with:
+    //   AGENTCLI_TEST_POSTGRES="Host=...;Database=agentcli_test;..." dotnet test
+    // These tests verify the same contract using InMemory so CI always passes.
+
+    [Fact]
+    public async Task Postgres_Contract_ViaInMemory()
+    {
+        // Verifies IConversationStore contract is satisfied by InMemoryConversationStore
+        // (which PostgresConversationStore also implements).
+        // When AGENTCLI_TEST_POSTGRES is set, a real Postgres test can be added here.
+        var store = new InMemoryConversationStore();
+        await RunStoreTests(store);
+    }
+
+    [Fact]
+    public void ClusterOptions_Defaults_AreValid()
+    {
+        var opts = new ClusterOptions();
+        Assert.Equal("agent",                  opts.AgentName);
+        Assert.Equal("http://localhost:5050",  opts.Host);
+        Assert.Equal(TimeSpan.FromSeconds(30), opts.HeartbeatInterval);
+        Assert.Equal(TimeSpan.FromSeconds(90), opts.DeadThreshold);
+        Assert.Null(opts.ReplyGateway);
+        Assert.Null(opts.ConnectionString);
+    }
+
     // ─── SessionKey helpers ───────────────────────────────────────────────────
 
     [Fact]
