@@ -58,6 +58,7 @@ public class CopilotTokenService
         var req = new HttpRequestMessage(HttpMethod.Get, CopilotTokenUrl);
         req.Headers.Add("Authorization", $"Bearer {githubToken}");
         req.Headers.Add("Accept", "application/json");
+        req.Headers.Add("User-Agent", "AgentCli/1.0");
 
         var res = await _http.SendAsync(req);
         if (!res.IsSuccessStatusCode)
