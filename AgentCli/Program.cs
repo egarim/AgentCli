@@ -21,10 +21,10 @@ async Task SaveGitHubTokenAsync(string token)
 }
 
 // ─── Memory + Soul ────────────────────────────────────────────────────────────
-var memory = new MemorySystem();
+var memory = MemorySystem.CreateFile();
 
 // Seed SOUL.md if it doesn't exist yet
-if (!File.Exists(memory.SoulPath))
+if (!await memory.Provider.ExistsAsync(MemorySystem.KeySoul))
 {
     await memory.WriteSoulAsync("""
         # SOUL.md
@@ -34,11 +34,11 @@ if (!File.Exists(memory.SoulPath))
         Be concise. Lead with the answer. Don't pad responses.
         You have tools — use them when helpful, not speculatively.
         """);
-    Console.WriteLine($"Created {memory.SoulPath} — edit it to change the agent's personality.");
+    Console.WriteLine($"Created SOUL.md — edit it to change the agent's personality.");
 }
 
 // Seed WORKFLOW_AUTO.md if it doesn't exist yet
-if (!File.Exists(memory.WorkflowAutoPath))
+if (!await memory.Provider.ExistsAsync(MemorySystem.KeyWorkflow))
 {
     await memory.WriteWorkflowAutoAsync("""
         # WORKFLOW_AUTO.md
@@ -49,7 +49,7 @@ if (!File.Exists(memory.WorkflowAutoPath))
         - MEMORY.md
         - memory/YYYY-MM-DD.md
         """);
-    Console.WriteLine($"Created {memory.WorkflowAutoPath} — edit it to control startup reads.");
+    Console.WriteLine($"Created WORKFLOW_AUTO.md — edit it to control startup reads.");
 }
 
 // ─── Services ─────────────────────────────────────────────────────────────────
@@ -240,7 +240,7 @@ agent.RegisterTool(
 Console.WriteLine();
 Console.ForegroundColor = ConsoleColor.Green;
 Console.WriteLine("AgentCli ready. Type your message (Ctrl+C to exit, 'exit' to quit)");
-Console.WriteLine($"Workspace: {memory.WorkflowAutoPath.Replace("WORKFLOW_AUTO.md", "")}");
+Console.WriteLine($"Workspace: {memory.WorkspaceDir ?? "(in-memory)"} [{memory.ProviderName}]");
 
 // Show which startup files were loaded
 var startupLoaded = await memory.RunStartupReadsAsync();
