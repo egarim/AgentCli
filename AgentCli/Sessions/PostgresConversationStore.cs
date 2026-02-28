@@ -300,13 +300,18 @@ public class PostgresConversationStore : IConversationStore, IAsyncDisposable
 
             -- Soul — single row "sivar-ai", written by admins only
             CREATE TABLE IF NOT EXISTS agentcli.souls (
-                agent_type   TEXT        PRIMARY KEY,  -- "sivar-ai"
-                name         TEXT        NOT NULL,
-                prompt       TEXT        NOT NULL,
-                version      INTEGER     NOT NULL DEFAULT 1,
-                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_by   TEXT
+                agent_type    TEXT        PRIMARY KEY,  -- "sivar-ai"
+                name          TEXT        NOT NULL,
+                prompt        TEXT        NOT NULL,
+                startup_reads TEXT[]      NOT NULL DEFAULT '{}',
+                version       INTEGER     NOT NULL DEFAULT 1,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by    TEXT
             );
+
+            -- Idempotent migration: add startup_reads to existing deployments
+            ALTER TABLE agentcli.souls
+                ADD COLUMN IF NOT EXISTS startup_reads TEXT[] NOT NULL DEFAULT '{}';
 
             -- Agent memory — shared world knowledge, written by admins
             CREATE TABLE IF NOT EXISTS agentcli.agent_memory (

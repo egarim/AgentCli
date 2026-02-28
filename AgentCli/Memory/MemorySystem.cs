@@ -11,12 +11,18 @@ namespace AgentCli;
 /// Keys used:
 ///   SOUL.md            — agent personality
 ///   MEMORY.md          — long-term curated memory
-///   WORKFLOW_AUTO.md   — required startup reads
+///   WORKFLOW_AUTO.md   — required startup reads (file-mode only; Postgres uses SoulConfig.StartupReads)
 ///   memory/YYYY-MM-DD.md — daily notes
+///
+/// Startup reads flow:
+///   1. If an ISoulProvider is wired in, use SoulConfig.StartupReads as the canonical list.
+///   2. Otherwise fall back to parsing WORKFLOW_AUTO.md (file-mode compatibility).
 /// </summary>
 public class MemorySystem
 {
     private readonly IMemoryProvider _provider;
+    private readonly ISoulProvider?  _soulProvider;
+    private readonly string          _agentType;
 
     public const string KeySoul         = "SOUL.md";
     public const string KeyMemory       = "MEMORY.md";
@@ -30,12 +36,17 @@ public class MemorySystem
     public string? WorkspaceDir =>
         (_provider as FileMemoryProvider)?.Resolve("").TrimEnd(Path.DirectorySeparatorChar);
 
-    public MemorySystem(IMemoryProvider provider)
+    public MemorySystem(
+        IMemoryProvider provider,
+        ISoulProvider?  soulProvider = null,
+        string          agentType    = "default")
     {
-        _provider = provider;
+        _provider     = provider;
+        _soulProvider = soulProvider;
+        _agentType    = agentType;
     }
 
-    // ─── Convenience factory ──────────────────────────────────────────────────
+    // ─── Convenience factories ────────────────────────────────────────────────
 
     /// <summary>Creates a MemorySystem backed by the local filesystem.</summary>
     public static MemorySystem CreateFile(string? dir = null)
@@ -43,7 +54,11 @@ public class MemorySystem
         var root = dir ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".agentcli", "workspace");
-        return new MemorySystem(new FileMemoryProvider(root));
+        var provider = new FileMemoryProvider(root);
+        // Wire in FileSoulProvider so StartupReads comes from ISoulProvider,
+        // with SOUL.md + WORKFLOW_AUTO.md as the file-mode serialisation.
+        var soul = new FileSoulProvider(provider);
+        return new MemorySystem(provider, soul);
     }
 
     // ─── Read ─────────────────────────────────────────────────────────────────
@@ -79,26 +94,44 @@ public class MemorySystem
         await _provider.AppendAsync(key, $"\n\n### {ts}\n\n{content.Trim()}");
     }
 
-    // ─── WORKFLOW_AUTO ────────────────────────────────────────────────────────
+    // ─── WORKFLOW_AUTO / StartupReads ─────────────────────────────────────────
 
     /// <summary>
-    /// Parses WORKFLOW_AUTO.md and loads all listed files.
-    /// Resolves YYYY-MM-DD placeholder → today + yesterday.
+    /// Returns the list of keys to read on startup.
+    ///
+    /// Source priority:
+    ///   1. ISoulProvider.GetAsync().StartupReads  (Postgres or FileSoulProvider)
+    ///   2. WORKFLOW_AUTO.md bullet list           (legacy / direct file edit)
     /// </summary>
-    public async Task<List<StartupFile>> RunStartupReadsAsync()
+    public async Task<string[]> GetStartupReadsAsync(CancellationToken ct = default)
     {
-        var results = new List<StartupFile>();
+        if (_soulProvider != null)
+        {
+            var soul = await _soulProvider.GetAsync(_agentType, ct);
+            if (soul != null) return soul.StartupReads;
+        }
 
+        // Fallback: parse WORKFLOW_AUTO.md directly
         var raw = await ReadWorkflowAutoAsync();
-        if (raw == null) return results;
+        if (raw == null) return [];
 
-        var entries = raw
+        return raw
             .Split('\n')
             .Select(l => l.Trim())
             .Where(l => l.StartsWith("- ") || l.StartsWith("* "))
             .Select(l => l[2..].Trim())
-            .Where(l => l.Length > 0)
-            .ToList();
+            .Where(l => l.Length > 0 && !l.StartsWith("#"))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Loads all files listed in StartupReads.
+    /// Resolves YYYY-MM-DD placeholder → today + yesterday.
+    /// </summary>
+    public async Task<List<StartupFile>> RunStartupReadsAsync(CancellationToken ct = default)
+    {
+        var results = new List<StartupFile>();
+        var entries = await GetStartupReadsAsync(ct);
 
         foreach (var entry in entries)
         {
@@ -128,7 +161,7 @@ public class MemorySystem
     /// <summary>
     /// Builds the full context string injected into the system prompt.
     /// Order: SOUL → MEMORY → daily notes → WORKFLOW_AUTO extras.
-    /// Deduplicates so files in WORKFLOW_AUTO aren't injected twice.
+    /// Deduplicates so files in StartupReads aren't injected twice.
     /// </summary>
     public async Task<string> BuildContextAsync()
     {

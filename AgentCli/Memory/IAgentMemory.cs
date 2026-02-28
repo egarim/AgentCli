@@ -3,16 +3,22 @@ namespace AgentCli;
 // ─── Soul ─────────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// The agent's identity — name, personality, system prompt.
+/// The agent's identity — name, personality, system prompt, and startup reads.
 /// Read-only at runtime. Written only by admins via direct DB access or admin API.
 /// Single soul: "sivar-ai".
 /// Loaded once on startup, cached, injected into every turn's system prompt.
+///
+/// StartupReads replaces WORKFLOW_AUTO.md — it is the single source of truth
+/// for which files/keys must be read on every agent startup.
+/// File-mode serialises this as SOUL.md + WORKFLOW_AUTO.md for human editability.
+/// Postgres-mode stores it as a TEXT[] column on the souls row.
 /// </summary>
 public sealed record SoulConfig(
-    string AgentType,   // "sivar-ai"
-    string Name,        // "Sivar AI"
-    string Prompt,      // the full SOUL.md content
-    int    Version,     // incremented on every admin update
+    string   AgentType,     // "sivar-ai"
+    string   Name,          // "Sivar AI"
+    string   Prompt,        // the full SOUL.md content
+    string[] StartupReads,  // e.g. ["MEMORY.md", "memory/YYYY-MM-DD.md"]
+    int      Version,       // incremented on every admin update
     DateTimeOffset UpdatedAt
 );
 

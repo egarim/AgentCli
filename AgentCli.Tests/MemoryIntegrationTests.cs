@@ -15,7 +15,117 @@ public class MemoryIntegrationTests
     private static readonly string? ConnStr =
         Environment.GetEnvironmentVariable("AGENTCLI_TEST_POSTGRES");
 
-    // ─── Soul ─────────────────────────────────────────────────────────────────
+    // ─── FileSoulProvider unit tests (no Postgres needed) ─────────────────────
+
+    [Fact]
+    public async Task FileSoul_ReturnsNull_WhenNoSoulFile()
+    {
+        var dir      = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var provider = new FileMemoryProvider(dir);
+        var soul     = new FileSoulProvider(provider);
+
+        var result = await soul.GetAsync("default");
+        Assert.Null(result);
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    [Fact]
+    public async Task FileSoul_ReturnsPrompt_WhenSoulFileExists()
+    {
+        var dir      = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var provider = new FileMemoryProvider(dir);
+        await provider.WriteAsync(MemorySystem.KeySoul, "# I am a test agent.");
+
+        var soul   = new FileSoulProvider(provider);
+        var result = await soul.GetAsync("default");
+
+        Assert.NotNull(result);
+        Assert.Equal("# I am a test agent.", result!.Prompt);
+        Assert.Equal("default",              result.AgentType);
+        Assert.Empty(result.StartupReads);   // no WORKFLOW_AUTO.md yet
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    [Fact]
+    public async Task FileSoul_ParsesStartupReads_FromWorkflowAuto()
+    {
+        var dir      = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var provider = new FileMemoryProvider(dir);
+        await provider.WriteAsync(MemorySystem.KeySoul, "# Soul");
+        await provider.WriteAsync(MemorySystem.KeyWorkflow, """
+            # WORKFLOW_AUTO.md
+            - MEMORY.md
+            - memory/YYYY-MM-DD.md
+            """);
+
+        var soul   = new FileSoulProvider(provider);
+        var result = await soul.GetAsync("default");
+
+        Assert.NotNull(result);
+        Assert.Equal(2,                      result!.StartupReads.Length);
+        Assert.Contains("MEMORY.md",         result.StartupReads);
+        Assert.Contains("memory/YYYY-MM-DD.md", result.StartupReads);
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    [Fact]
+    public async Task MemorySystem_GetStartupReads_DelegatesTo_FileSoulProvider()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var ms  = MemorySystem.CreateFile(dir);
+
+        await ms.WriteSoulAsync("# My Soul");
+        await ms.WriteWorkflowAutoAsync("- MEMORY.md\n- memory/YYYY-MM-DD.md\n");
+
+        var reads = await ms.GetStartupReadsAsync();
+        Assert.Equal(2, reads.Length);
+        Assert.Contains("MEMORY.md", reads);
+        Assert.Contains("memory/YYYY-MM-DD.md", reads);
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    [Fact]
+    public async Task MemorySystem_GetStartupReads_FallsBack_WhenNoSoulProvider()
+    {
+        // MemorySystem without soul provider — should still parse WORKFLOW_AUTO.md
+        var dir      = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var provider = new FileMemoryProvider(dir);
+        var ms       = new MemorySystem(provider, soulProvider: null);
+
+        await ms.WriteWorkflowAutoAsync("- MEMORY.md\n- memory/YYYY-MM-DD.md\n");
+
+        var reads = await ms.GetStartupReadsAsync();
+        Assert.Equal(2, reads.Length);
+        Assert.Contains("MEMORY.md", reads);
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    [Fact]
+    public async Task FileSoul_Version_Changes_AfterSoulFileUpdate()
+    {
+        var dir      = Path.Combine(Path.GetTempPath(), $"agentcli-test-{Guid.NewGuid():N}");
+        var provider = new FileMemoryProvider(dir);
+        await provider.WriteAsync(MemorySystem.KeySoul, "# Soul v1");
+
+        var soul = new FileSoulProvider(provider);
+        var v1   = await soul.GetVersionAsync("default");
+
+        // Small delay to ensure mtime differs
+        await Task.Delay(10);
+        await provider.WriteAsync(MemorySystem.KeySoul, "# Soul v2");
+
+        var v2 = await soul.GetVersionAsync("default");
+        Assert.NotEqual(v1, v2);
+
+        Directory.Delete(dir, recursive: true);
+    }
+
+    // ─── PostgresSoulProvider integration tests ────────────────────────────────
 
     [SkippableFact]
     public async Task Soul_GetAsync_ReturnsNull_WhenNotSeeded()
@@ -31,7 +141,7 @@ public class MemoryIntegrationTests
     }
 
     [SkippableFact]
-    public async Task Soul_GetAsync_ReturnsSeededSoul()
+    public async Task Soul_GetAsync_ReturnsSeededSoul_WithStartupReads()
     {
         Skip.If(ConnStr is null, "AGENTCLI_TEST_POSTGRES not set");
 
@@ -42,10 +152,14 @@ public class MemoryIntegrationTests
         await conn.OpenAsync();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO agentcli.souls (agent_type, name, prompt, version, updated_by)
-            VALUES ('test-soul', 'Test Agent', 'I am a test agent.', 1, 'test')
+            INSERT INTO agentcli.souls
+                (agent_type, name, prompt, startup_reads, version, updated_by)
+            VALUES
+                ('test-soul', 'Test Agent', 'I am a test agent.',
+                 ARRAY['MEMORY.md','memory/YYYY-MM-DD.md'], 1, 'test')
             ON CONFLICT (agent_type) DO UPDATE
-            SET name = EXCLUDED.name, prompt = EXCLUDED.prompt, version = EXCLUDED.version
+            SET name = EXCLUDED.name, prompt = EXCLUDED.prompt,
+                startup_reads = EXCLUDED.startup_reads, version = EXCLUDED.version
             """;
         await cmd.ExecuteNonQueryAsync();
 
@@ -57,6 +171,8 @@ public class MemoryIntegrationTests
         Assert.Equal("Test Agent",          result.Name);
         Assert.Equal("I am a test agent.",  result.Prompt);
         Assert.Equal(1,                     result.Version);
+        Assert.Equal(2,                     result.StartupReads.Length);
+        Assert.Contains("MEMORY.md",        result.StartupReads);
 
         // Cleanup
         cmd.CommandText = "DELETE FROM agentcli.souls WHERE agent_type = 'test-soul'";
@@ -198,14 +314,12 @@ public class MemoryIntegrationTests
             await mem.WriteAsync(userA, ch, "secret", "user-a-secret");
             await mem.WriteAsync(userB, ch, "secret", "user-b-secret");
 
-            // Each user can only see their own
             var aSecret = await mem.GetAsync(userA, ch, "secret");
             var bSecret = await mem.GetAsync(userB, ch, "secret");
 
             Assert.Equal("user-a-secret", aSecret);
             Assert.Equal("user-b-secret", bSecret);
 
-            // GetAll for A doesn't include B's data
             var aAll = await mem.GetAllAsync(userA, ch);
             Assert.All(aAll, e => Assert.Equal(userA, e.UserId));
         }
@@ -265,3 +379,5 @@ public class MemoryIntegrationTests
         }
     }
 }
+
+

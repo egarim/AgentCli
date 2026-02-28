@@ -49,7 +49,7 @@ public sealed class PostgresSoulProvider : ISoulProvider, IAsyncDisposable
         await using var conn = await _dataSource.OpenConnectionAsync(ct);
         await using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT agent_type, name, prompt, version, updated_at
+            SELECT agent_type, name, prompt, startup_reads, version, updated_at
             FROM agentcli.souls
             WHERE agent_type = $1
             """;
@@ -59,11 +59,14 @@ public sealed class PostgresSoulProvider : ISoulProvider, IAsyncDisposable
         if (!await reader.ReadAsync(ct)) return null;
 
         _cached = new SoulConfig(
-            AgentType: reader.GetString(0),
-            Name:      reader.GetString(1),
-            Prompt:    reader.GetString(2),
-            Version:   reader.GetInt32(3),
-            UpdatedAt: reader.GetFieldValue<DateTimeOffset>(4));
+            AgentType:    reader.GetString(0),
+            Name:         reader.GetString(1),
+            Prompt:       reader.GetString(2),
+            StartupReads: reader.IsDBNull(3)
+                              ? []
+                              : reader.GetFieldValue<string[]>(3),
+            Version:      reader.GetInt32(4),
+            UpdatedAt:    reader.GetFieldValue<DateTimeOffset>(5));
 
         _lastCheck = DateTimeOffset.UtcNow;
         return _cached;
