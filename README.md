@@ -20,6 +20,7 @@ Ships as a console app today; designed to run as a cluster of stateless agents t
 - [Output Formatting](#output-formatting)
 - [Cluster Mode](#cluster-mode)
 - [Token Tracking & Limits](#token-tracking--limits)
+- [Maps & Location](#maps--location)
 - [Configuration Reference](#configuration-reference)
 - [REPL Commands](#repl-commands)
 - [Adding Providers / Tools / Skills](#extending)
@@ -737,6 +738,209 @@ public class SubscriptionPolicy : ITokenPolicy
         return TokenPolicyResult.Allow();
     }
 }
+```
+
+---
+
+## Maps & Location
+
+AgentCli has a full maps abstraction layer with three independent capabilities — each swappable without touching the others.
+
+### Capabilities
+
+| Capability | Interface | What it does |
+|---|---|---|
+| **Geocoding** | `IGeocoder` | Address → coordinates (forward) + coordinates → address (reverse) |
+| **Place search** | `IPlaceSearch` | Search nearby places by query/category |
+| **Map rendering** | `IStaticMapRenderer` | Coordinates → static map image (PNG bytes) |
+
+### Provider matrix
+
+| Provider ID | Capability | Cost | Key needed |
+|---|---|---|---|
+| `nominatim` | Geocoder | Free (1 req/s, OSM fair-use) | None |
+| `osm-overpass` | Place search | Free (Overpass API) | None |
+| `osm-static` | Map renderer | Free (OSM static tiles) | None |
+| `azure-maps` | Geocoder + Map renderer | Free 250k/month | `AZURE_MAPS_KEY` |
+| `google-geocoding` | Geocoder | $0.005/req | `GOOGLE_MAPS_API_KEY` |
+| `google-places` | Place search | $0.017–$0.032/req | `GOOGLE_MAPS_API_KEY` |
+| `google-static` | Map renderer | $0.002/map | `GOOGLE_MAPS_API_KEY` |
+
+### Presets
+
+```csharp
+// Zero cost — OSM everywhere (rate-limited, not for high volume)
+MapOptions.Free
+
+// Best quality — Google for everything, OSM fallbacks
+MapOptions.Google
+
+// Balanced — Azure for geocoding+rendering (free 250k/mo), Google for place search
+MapOptions.AzureWithGooglePlaces
+```
+
+### Environment variables
+
+```bash
+# Free (self-hosted instances — optional, defaults to public OSM endpoints)
+NOMINATIM_BASE_URL=https://your-nominatim.example.com
+OVERPASS_BASE_URL=https://your-overpass.example.com
+OSM_STATIC_BASE_URL=https://your-staticmap.example.com
+
+# Azure Maps (free 250k/month)
+AZURE_MAPS_KEY=your-key
+
+# Google Maps (pay-per-use)
+GOOGLE_MAPS_API_KEY=your-key
+```
+
+### Wire it up
+
+```csharp
+var http     = new HttpClient();
+var options  = MapOptions.AzureWithGooglePlaces;   // or .Free / .Google
+var registry = MapRegistry.Build(options, http);   // auto-registers from env vars
+var pipeline = new MapPipeline(registry, options);
+```
+
+### Geocoding
+
+```csharp
+// Forward: address → coordinates
+var loc = await pipeline.GeocodeAsync("Mariahilfer Str. 1, Vienna");
+// loc.Latitude, loc.Longitude, loc.Address, loc.Name
+
+// Reverse: coordinates → address
+var loc = await pipeline.ReverseGeocodeAsync(48.2085, 16.3721);
+// loc.Address = "Mariahilfer Straße 1, 1060 Wien, Austria"
+```
+
+### Place search
+
+```csharp
+var userLocation = new NormalizedLocation(48.2085, 16.3721);
+
+var places = await pipeline.SearchNearbyAsync(
+    query:        "coffee",
+    near:         userLocation,
+    maxResults:   5,
+    radiusMeters: 500
+);
+
+foreach (var p in places)
+    Console.WriteLine($"{p.Name} — {p.Address} (rating: {p.Rating})");
+
+// Get extended details (phone, website, opening hours)
+var details = await pipeline.GetPlaceDetailsAsync(places[0].PlaceId);
+Console.WriteLine(details?.PhoneNumber);
+Console.WriteLine(details?.OpeningHours);
+```
+
+### Map rendering
+
+```csharp
+var center = new NormalizedLocation(48.2085, 16.3721);
+var image  = await pipeline.RenderAsync(center, zoom: 15, width: 600, height: 400);
+
+if (image != null)
+{
+    // image.Bytes    — PNG bytes, ready to send as Telegram photo
+    // image.MimeType — "image/png"
+    // image.AttributionText — "© OpenStreetMap contributors" (include when required)
+    await File.WriteAllBytesAsync("map.png", image.Bytes);
+}
+// RenderAsync never throws — returns null on failure so reply continues as text
+```
+
+### NormalizedLocation
+
+The core type that flows through the whole subsystem. Also used by `TelegramConnector` for inbound location messages.
+
+```csharp
+var loc = new NormalizedLocation(
+    Latitude:      48.2085,
+    Longitude:     16.3721,
+    AccuracyMeters: 10,
+    Name:          "Starbucks",
+    Address:       "Mariahilfer Str. 1, Vienna",
+    PlaceId:       "ChIJ...",       // provider-specific ID
+    IsLive:        false,           // true = live GPS tracking
+    Source:        "place"          // "pin" | "place" | "live" | "geocoded"
+);
+
+loc.ToText();          // "📍 Starbucks — Mariahilfer Str. 1, Vienna (48.208500, 16.372100)"
+loc.ToOsmUrl();        // "https://www.openstreetmap.org/?mlat=48.208500&mlon=16.372100#map=15/..."
+loc.ToGoogleMapsUrl(); // "https://www.google.com/maps/search/?api=1&query=Starbucks&query_place_id=ChIJ..."
+```
+
+Text format by source:
+
+| Source | Format |
+|---|---|
+| `pin` (plain coords) | `📍 48.208500, 16.372100` |
+| `place` (has name/address) | `📍 Starbucks — Mariahilfer Str. 1 (48.208500, 16.372100)` |
+| `live` (GPS tracking) | `🛰 Live location: 48.208500, 16.372100` |
+
+### Enrich inbound locations
+
+By default `ReverseGeocodeInbound = false` (avoid surprise API costs). Enable to auto-enrich pin drops with name + address:
+
+```csharp
+var options = new MapOptions
+{
+    GeocoderProvider       = "azure-maps",   // free 250k/month
+    ReverseGeocodeInbound  = true,           // enrich pins on inbound
+    RenderMapOnInbound     = true,           // render map image on inbound
+    IncludeMapLink         = true,           // append OSM link to reply
+};
+```
+
+Then in your connector's inbound handler:
+
+```csharp
+// 1. Build NormalizedLocation from Telegram location message
+var loc = new NormalizedLocation(msg.Location.Latitude, msg.Location.Longitude);
+
+// 2. Optionally enrich with reverse geocode (name + address)
+loc = await pipeline.EnrichAsync(loc);
+
+// 3. Format reply text (location text + OSM link)
+var replyText = pipeline.FormatLocationReply(loc);
+
+// 4. Render map image (non-fatal — null if provider unavailable)
+var map = await pipeline.RenderAsync(loc);
+
+// 5. Send: text reply + optional map image
+await connector.SendTextAsync(chatId, replyText);
+if (map != null)
+    await connector.SendPhotoAsync(chatId, map.Bytes, map.AttributionText);
+```
+
+### Add a custom provider
+
+Implement any of the three interfaces — they're independent:
+
+```csharp
+public sealed class MapboxStaticRenderer : IStaticMapRenderer
+{
+    public string Id          => "mapbox-static";
+    public string DisplayName => "Mapbox Static Maps (50k free/month)";
+
+    public async Task<MapImage> RenderAsync(
+        NormalizedLocation center, int zoom, int width, int height,
+        CancellationToken ct = default)
+    {
+        var url   = $"https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/" +
+                    $"pin-s+ff0000({center.Longitude},{center.Latitude})/" +
+                    $"{center.Longitude},{center.Latitude},{zoom}/{width}x{height}" +
+                    $"?access_token={_token}";
+        var bytes = await _http.GetByteArrayAsync(url, ct);
+        return new MapImage(bytes, "image/png", width, height, Id, "© Mapbox");
+    }
+}
+
+// Register it
+registry.RegisterRenderer(new MapboxStaticRenderer(http, token));
 ```
 
 ---
